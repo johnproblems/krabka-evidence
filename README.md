@@ -31,13 +31,26 @@ script rebuilds the release binary, runs every filmed command, renders
 both formats, and verifies each file: decodes cleanly, 10–15 s long,
 animated non-blank frames.
 
-## Quickstart
+## Install
+
+Stable Rust (edition 2024), then:
 
 ```sh
-# Build synthetic three-ledger inputs (no cluster needed).
+git clone https://github.com/johnproblems/krabka-evidence
+cd krabka-evidence
+cargo build --release   # -> ./target/release/krabka-evidence
+```
+
+(`cargo install --path .` puts `krabka-evidence` on PATH instead. The
+examples below assume it is on PATH.)
+
+## Quickstart: try it with fixtures (no cluster)
+
+```sh
+# 1. Build synthetic three-ledger inputs.
 krabka-evidence fixture --scenario all --out /tmp/demo
 
-# Build a signed pack from the clean scenario.
+# 2. Build a signed pack from the clean scenario.
 krabka-evidence --from 2026-09-01 --to 2026-10-01 \
   --audit /tmp/demo/clean/audit \
   --metadata /tmp/demo/clean/metadata \
@@ -46,19 +59,63 @@ krabka-evidence --from 2026-09-01 --to 2026-10-01 \
   --cluster-id fixture-cluster \
   --sign-with /tmp/demo/clean/keys/auditor.priv.pkcs8 \
   -o /tmp/demo/clean/evidence
+# -> CLEAN: evidence pack holds no findings
 
-# Verify the pack (re-checks the signature; optionally re-hashes inputs).
+# 3. Verify the pack (re-checks the signature; optionally re-hashes inputs).
 krabka-evidence verify /tmp/demo/clean/evidence
 krabka-evidence verify /tmp/demo/clean/evidence --audit /tmp/demo/clean/audit
 ```
 
-The tamper scenarios each produce exactly one finding: `missing-audit`
-(deleted tail segment), `flipped-sig` (forged operator signature under a
-re-sealed chain), `approver-change` (mid-window approver drift),
-`corrupt-chain` (broken checkpoint signature), `expired-approval`
-(approval after expiry), `worm-tamper` (rewritten manifest link).
+Then swap `clean` for a tamper scenario and re-run step 2 to see a
+finding: `missing-audit` (deleted tail segment), `flipped-sig` (forged
+operator signature under a re-sealed chain), `approver-change`
+(mid-window approver drift), `corrupt-chain` (broken checkpoint
+signature), `expired-approval` (approval after expiry), `worm-tamper`
+(rewritten manifest link). Each produces exactly one finding;
 `unsigned` stays clean with attested-only notes. Each scenario dir holds
 a `README.txt` describing its tamper.
+
+## Usage: run it against your cluster
+
+1. **Copy the ledgers aside.** Copy (never move, never point at live
+   state) the audit partition directory, the `__cluster_metadata`
+   partition directory (or a `krabka-backup` capture), and the WORM
+   archive directory — or use the `s3://bucket[/prefix]` URL directly
+   for the archive.
+2. **Assemble the keys file.** One TOML file with `[[operator_keys]]`
+   plus optional `[[audit_keys]]` / `[[worm_keys]]` tables; see
+   [Keys](#keys) below. Missing keys never fail the run — the affected
+   checks grade `not-checked` and say so.
+3. **Mint the auditor key** (once; keep it offline — the cluster never
+   sees it):
+   ```sh
+   krabka-evidence keygen --out auditor --key-id auditor-1
+   ```
+4. **Build the pack:**
+   ```sh
+   krabka-evidence --from 2026-09-01 --to 2026-10-01 \
+     --audit ./audit-partition --metadata ./cluster-metadata \
+     --archive s3://bucket/tiered --operator-keys keys.toml \
+     --cluster-id prod --sign-with auditor.priv.pkcs8 \
+     --auditor-key-id auditor-1 -o evidence/
+   ```
+   `--from`/`--to` accept `YYYY-MM-DD`, RFC 3339, or epoch millis
+   (unbounded when absent, `--to` exclusive). `--cluster-id` is
+   required for freeze signatures (the preimage covers it). The output
+   directory must not nest with any input.
+5. **Read the result.** Exit `0` is clean, `1` is findings — open
+   `evidence/report.html`, or `report.json` for machines (see
+   [Findings guide](#findings-guide)). An auditor re-verifies without a
+   broker:
+   ```sh
+   krabka-evidence verify evidence/ --auditor-public-key auditor.pub
+   ```
+   Add `--audit ... --metadata ... --archive ...` to re-hash the inputs
+   against the pack's digests, or `--fail-on-findings` to reject packs
+   that hold findings.
+
+The full operator runbook (S3 setup, WORM grading flags, limits for
+hostile inputs, CI gating) is [docs/OPERATORS.md](docs/OPERATORS.md).
 
 ## How it works
 
@@ -89,13 +146,21 @@ with tests pinning them to declaration order.
 
 | Check | Rule | Finding when |
 |---|---|---|
+| Audit hash chain | Partition chain recomputes, checkpoints verify | Broken link, bad checkpoint, or no signed anchor at all |
+| Audit loss windows | Declared fail-open loss markers surface | Records lost, with count and generation |
+| WORM archive | Manifest chain, signatures, and digests verify | Tamper, head mismatch (`--expect-head`), or orphans (`--strict-orphans`) |
+| Metadata coverage | The input holds the history the checks need | History compacted away before offset N |
 | Applied with no audit event | Every metadata freeze / consumed proposal has a matching audit event | The act is missing from the audit trail (fail-open gap) |
 | Audited action not in metadata | Every audit `Applied` has a matching metadata record | Forged or replayed event |
 | Signature verification | Every operator signature verifies | Bad signature, unknown key, half-signed record |
-| Two-person rule | Approvers ≠ proposer, approvals before expiry | Self-approval, double approval, late approval/consumption |
+| Two-person rule | Approvals distinct, timely, quorum of two | Self/double/late approval, under-quorum consumption |
 | Bypassed controls | `Bypassed` phases and audit-only recovery listed | Control bypassed, with reason text |
 | Approver set changes | Fingerprint stable within the window | Approver set changed mid-window |
 | Gated operations | Succeeded `DeleteTopic`/`DeleteRecords` has a prior consumption | Gated op without approval |
+
+Each check is one row in the report; `--list-checks` prints them with
+their kebab-case ids. Full semantics live in
+[docs/CHECKS.md](docs/CHECKS.md).
 
 Corroboration is phase-aware: a freeze needs an `applied` freeze-path
 event, and a consumed proposal needs a `consumed`/`applied` event — an
@@ -170,17 +235,17 @@ with `krabka-evidence keygen --out auditor`, then sign with
 ## CLI reference
 
 ```sh
-krabka-evidence --from 2026-09-01 --to 2026-10-01 \
-  --audit ./audit-partition --metadata ./cluster-metadata \
-  --archive s3://bucket/tiered --operator-keys keys.toml \
-  --cluster-id ID --sign-with auditor.priv.pkcs8 -o evidence/
-krabka-evidence verify evidence/ [--auditor-public-key key.pub] \
-  [--audit ... --metadata ... --archive ...]
-krabka-evidence keygen --out auditor
-krabka-evidence fixture --scenario all --out /tmp/demo
+krabka-evidence [FLAGS]                # build a pack (see Usage above)
+krabka-evidence verify PACK [FLAGS]    # verify a pack, optionally re-hashing inputs
+krabka-evidence keygen --out NAME      # mint an auditor keypair
+krabka-evidence fixture --scenario all --out DIR   # synthetic inputs
+krabka-evidence completions bash       # shell completions
 ```
 
-`--from`/`--to` accept `YYYY-MM-DD`, RFC 3339, or epoch millis. `--metadata` accepts a
+Useful flags: `--format json` (one machine-readable summary object),
+`--quiet` / `--verbose`, `--only <checks>` with `--require-all-checked`
+for CI gates, `--list-checks`, `--max-timeline-rows`,
+`--max-segment-bytes`, `--archive-timeout-secs`. `--metadata` accepts a
 segment directory, a snapshot directory, or a `krabka-backup` capture
 (`restore-inputs/…`). `--archive` accepts a local directory or an
 `s3://bucket[/prefix]` URL (`--s3-region`, `--s3-endpoint`,
@@ -188,6 +253,17 @@ segment directory, a snapshot directory, or a `krabka-backup` capture
 `--expect-head` pins the WORM tip; `--deep` recomputes every object
 digest; `--strict-orphans` fails on orphan objects;
 `--allow-epoch-restarts` accepts chain restarts.
+
+## Docs
+
+- [docs/OPERATORS.md](docs/OPERATORS.md) — the operator runbook: inputs,
+  keys, S3, limits, exit codes.
+- [docs/CHECKS.md](docs/CHECKS.md) — what each of the eleven checks
+  verifies, with finding titles.
+- [docs/FORMAT.md](docs/FORMAT.md) — the pack layout, `report.json`
+  schema, canonical JSON, and signing.
+- [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) — what a pack proves,
+  trust roots, and known blind spots.
 
 ## Troubleshooting
 

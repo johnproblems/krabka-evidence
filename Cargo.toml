@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Offline cross-ledger evidence tool for Krabka: one signed report from every ledger"
-repository = "https://github.com/krabka-io/krabka-broker"
+repository = "https://github.com/johnproblems/krabka-evidence"
 
 [[bin]]
 name = "krabka-evidence"
