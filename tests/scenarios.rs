@@ -428,6 +428,10 @@ fn archive_timeout_fails_closed() {
         ])
         .env("AWS_ACCESS_KEY_ID", "test")
         .env("AWS_SECRET_ACCESS_KEY", "test")
+        // The client must use the static creds above: in CI the runner
+        // network answers 169.254.169.254 immediately, so an IMDS lookup
+        // would fail fast instead of hanging on the blackhole.
+        .env("AWS_EC2_METADATA_DISABLED", "true")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .output()
