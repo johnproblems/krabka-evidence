@@ -1,0 +1,74 @@
+# krabka-evidence: one signed report from every ledger.
+#
+# Krabka crates are pinned to release tags, as the PRD requires, because the
+# broker crates are not on crates.io:
+#   - krabka-broker family at v1.0.5 (audit, guard, remote-storage, broker)
+#   - krabka-protocol family at 0.6.0 from crates.io, which is the same
+#     revision the broker's own [patch.crates-io] pins (rev 574e0e3 == v0.6.0),
+#     so record types unify with the broker crates' types.
+[package]
+name = "krabka-evidence"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Offline cross-ledger evidence tool for Krabka: one signed report from every ledger"
+repository = "https://github.com/krabka-io/krabka-broker"
+
+[[bin]]
+name = "krabka-evidence"
+path = "src/main.rs"
+
+[lib]
+name = "krabka_evidence"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+
+[dependencies]
+# --- Pinned krabka inputs (PRD: git dependencies pinned to a release tag) ---
+krabka-audit = { git = "https://github.com/krabka-io/krabka-broker.git", tag = "v1.0.5" }
+krabka-guard = { git = "https://github.com/krabka-io/krabka-broker.git", tag = "v1.0.5" }
+krabka-remote-storage = { git = "https://github.com/krabka-io/krabka-broker.git", tag = "v1.0.5" }
+krabka-broker = { git = "https://github.com/krabka-io/krabka-broker.git", tag = "v1.0.5" }
+krabka-object-store = { git = "https://github.com/krabka-io/krabka-broker.git", tag = "v1.0.5" }
+krabka-metadata = "0.6.0"
+krabka-protocol = "0.6.0"
+krabka-ids = "0.6.0"
+# --- General ---
+anyhow = "1"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+futures-util = "0.3"
+hex = "0.4"
+object_store = { version = "0.14", default-features = false }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+assert2 = "0.4"
+predicates = "3"
+proptest = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
