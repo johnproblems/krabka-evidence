@@ -7,8 +7,9 @@
 //! (epoch restarts, unsigned manifests) are notes.
 //!
 //! The archive input is a local directory or an `s3://bucket[/prefix]`
-//! URL. Credentials for S3 come from the ambient AWS chain, exactly as in
-//! `krabka-worm-verify`; the tool never talks to a live broker.
+//! URL. S3 credentials come from `AWS_ACCESS_KEY_ID` /
+//! `AWS_SECRET_ACCESS_KEY` when both are set, else the backend's own
+//! instance/task-role chain; the tool never talks to a live broker.
 
 use std::path::PathBuf;
 
@@ -35,6 +36,32 @@ pub struct ArchiveSpec {
     pub label: String,
 }
 
+/// Read static S3 credentials from the environment, if both halves exist.
+///
+/// The store builder only consults its instance/task-role chain, never the
+/// environment — without this, `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+/// would be silently ignored and every credential lookup would hit the
+/// metadata server first.
+fn ambient_s3_credentials() -> (Option<String>, Option<String>) {
+    let key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+    let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+    static_s3_credentials(key.as_deref(), secret.as_deref())
+}
+
+/// Keep an S3 credential pair only when both halves are present and non-empty.
+fn static_s3_credentials(
+    key: Option<&str>,
+    secret: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    match (
+        key.filter(|value| !value.is_empty()),
+        secret.filter(|value| !value.is_empty()),
+    ) {
+        (Some(key), Some(secret)) => (Some(key.to_string()), Some(secret.to_string())),
+        _ => (None, None),
+    }
+}
+
 /// Parse `--archive` as a local directory or an `s3://bucket[/prefix]` URL.
 ///
 /// # Errors
@@ -59,6 +86,7 @@ pub fn parse_archive_spec(
             ));
         }
         let prefix = prefix.filter(|prefix| !prefix.is_empty());
+        let (access_key_id, secret_access_key) = ambient_s3_credentials();
         return Ok(ArchiveSpec {
             config: ObjectStoreConfig::S3(S3Config {
                 bucket: bucket.to_string(),
@@ -66,6 +94,8 @@ pub fn parse_archive_spec(
                 region: region.to_string(),
                 endpoint,
                 allow_http,
+                access_key_id,
+                secret_access_key,
                 ..Default::default()
             }),
             prefix,
@@ -327,4 +357,23 @@ pub fn parse_chain_head(text: &str) -> Result<ChainHead, String> {
         bytes[index] = u8::from_str_radix(pair, 16).map_err(|_| "invalid hex".to_string())?;
     }
     Ok(ChainHead(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::static_s3_credentials;
+
+    #[test]
+    fn credential_pairs_need_both_halves() {
+        assert_eq!(
+            static_s3_credentials(Some("key"), Some("secret")),
+            (Some("key".to_string()), Some("secret".to_string()))
+        );
+        assert_eq!(static_s3_credentials(None, None), (None, None));
+        assert_eq!(static_s3_credentials(Some("key"), None), (None, None));
+        assert_eq!(
+            static_s3_credentials(Some(""), Some("secret")),
+            (None, None)
+        );
+    }
 }

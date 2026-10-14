@@ -6,6 +6,10 @@
 use std::{
     net::TcpListener,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use assert_cmd::Command;
@@ -394,8 +398,11 @@ fn max_timeline_rows_truncates_with_note() {
 fn archive_timeout_fails_closed() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("blackhole binds");
     let port = listener.local_addr().expect("blackhole has a port").port();
+    let contacted = Arc::new(AtomicBool::new(false));
+    let flag = contacted.clone();
     std::thread::spawn(move || {
         if let Ok((_stream, _)) = listener.accept() {
+            flag.store(true, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_secs(30));
         }
     });
@@ -428,10 +435,6 @@ fn archive_timeout_fails_closed() {
         ])
         .env("AWS_ACCESS_KEY_ID", "test")
         .env("AWS_SECRET_ACCESS_KEY", "test")
-        // The client must use the static creds above: in CI the runner
-        // network answers 169.254.169.254 immediately, so an IMDS lookup
-        // would fail fast instead of hanging on the blackhole.
-        .env("AWS_EC2_METADATA_DISABLED", "true")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .output()
@@ -441,6 +444,10 @@ fn archive_timeout_fails_closed() {
     assert!(
         stderr.contains("timed out after 2s"),
         "the error names the timeout: {stderr}"
+    );
+    assert!(
+        contacted.load(Ordering::SeqCst),
+        "the client connected to the endpoint (no credential detour)"
     );
 }
 

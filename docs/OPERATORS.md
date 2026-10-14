@@ -54,9 +54,9 @@ embedded in the pack unless `--auditor-public-key` pins the expected
 
 ## S3 archives
 
-`--archive s3://bucket[/prefix]` reads through the ambient AWS chain
-(environment, shared config, instance role — exactly as
-`krabka-worm-verify`). `--s3-region` defaults to `us-east-1`;
+`--archive s3://bucket[/prefix]` reads with `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` from the environment when both are set, else the
+instance/task role. `--s3-region` defaults to `us-east-1`;
 `--s3-endpoint` points at compatible stores (MinIO, LocalStack), with
 `--allow-http` for plaintext endpoints. Remote archives are never hashed:
 their `report.json` digest reads `remote:<url>`, and re-hashing one is
