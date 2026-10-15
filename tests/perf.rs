@@ -22,7 +22,7 @@ fn bulk_audit_meets_throughput_floor() {
 
     let dir = tempfile::tempdir().unwrap();
     let bulk = dir.path().join("bulk");
-    let paths = generate_bulk_audit(&bulk, EVENTS).unwrap();
+    let paths = generate_bulk_audit(&bulk, EVENTS, None).unwrap();
 
     let started = Instant::now();
     Command::cargo_bin("krabka-evidence")

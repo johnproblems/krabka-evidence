@@ -71,7 +71,11 @@ pub fn parse_window(from: Option<&str>, to: Option<&str>) -> Result<Window, Evid
 }
 
 /// Parse one time flag value: `YYYY-MM-DD`, RFC 3339, or epoch millis.
+///
+/// Surrounding whitespace is ignored, and millis may carry a leading sign
+/// (negative values are pre-1970 instants).
 fn parse_time(text: &str) -> Result<i64, EvidenceError> {
+    let text = text.trim();
     if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
         let midnight = date
             .and_hms_opt(0, 0, 0)
@@ -83,8 +87,10 @@ fn parse_time(text: &str) -> Result<i64, EvidenceError> {
     if let Ok(moment) = text.parse::<DateTime<Utc>>() {
         return Ok(moment.timestamp_millis());
     }
-    if !text.is_empty()
-        && text.bytes().all(|byte| byte.is_ascii_digit())
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    let digits = digits.strip_prefix('-').unwrap_or(digits);
+    if !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
         && let Ok(millis) = text.parse::<i64>()
     {
         return Ok(millis);

@@ -9,6 +9,8 @@ code is asserted, so the demo fails instead of filming a surprise.
 Outputs (each 10-15 s):
   docs/demo/demo-clean.{mp4,gif}   fixture -> build (CLEAN) -> verify (OK)
   docs/demo/demo-tamper.{mp4,gif}  build flipped-sig (FINDINGS) -> finding detail
+  docs/demo/demo-bypass.{mp4,gif}  build bypass (FINDINGS) -> finding detail
+  docs/demo/demo-json.{mp4,gif}    build --format json -> verify json -> trust ids
 
 Needs: ffmpeg + ffprobe on PATH, a monospace TTF (DejaVu Sans Mono via
 fontconfig by default), and a release build (built automatically).
@@ -270,11 +272,14 @@ def film_clean(shell, binary):
     assert out[-1] == "CLEAN: evidence pack holds no findings", out
     demo.command(cmd, 75)
     demo.output(out, stagger=0.1)
-    cmd = "krabka-evidence verify evidence --format json"
+    cmd = (
+        "krabka-evidence verify evidence --format json "
+        "| python3 -c \"import json,sys; s=json.load(sys.stdin); "
+        "print(s['authentic'], s['findings'])\""
+    )
     out = shell.execute(cmd)
-    summary = json.loads(out[0])
-    assert summary["authentic"] is True and summary["findings"] == 0, out
-    demo.command(cmd, 65)
+    assert out == ["True 0"], out
+    demo.command(cmd, 90)
     demo.output(out)
     return demo
 
@@ -309,6 +314,84 @@ def film_tamper(shell, binary):
     out = shell.execute(cmd)
     assert out == ["signature-verification - Signature does not verify @ audit 1"], out
     demo.command(cmd, 65)
+    demo.output(out)
+    return demo
+
+
+def film_bypass(shell, binary):
+    """Build a bypassed pack and show the finding; returns the timeline."""
+    demo = Timeline("krabka-evidence — bypass detected, end to end")
+    cmd = f"export PATH={os.path.dirname(binary)}:$PATH"
+    shell.execute(cmd)
+    demo.command(cmd, 65)
+    cmd = "krabka-evidence fixture --scenario bypass --out /tmp/ev-demo"
+    out = shell.execute(cmd)
+    assert out == ["wrote /tmp/ev-demo/bypass"], out
+    demo.command(cmd, 65)
+    demo.output(out)
+    shell.execute("cd /tmp/ev-demo/bypass")
+    demo.command("cd /tmp/ev-demo/bypass", 40)
+    cmd = (
+        "krabka-evidence --audit audit --metadata metadata --archive archive "
+        "--operator-keys keys/keys.toml --cluster-id fixture-cluster "
+        "--sign-with keys/auditor.priv.pkcs8 -o evidence"
+    )
+    out = shell.execute(cmd, expect=1)
+    assert out[-1] == "FINDINGS: evidence pack holds 1 finding(s)", out
+    demo.command(cmd, 75)
+    demo.output(out, stagger=0.1)
+    cmd = (
+        "python3 -c \"import json; f = "
+        "json.load(open('evidence/report.json'))['findings'][0]; "
+        "print(f['check'], '-', f['title'], '@ audit', f['audit_offset'])\""
+    )
+    out = shell.execute(cmd)
+    assert out == ["bypass-listing - Gated action bypassed approval @ audit 14"], out
+    demo.command(cmd, 65)
+    demo.output(out)
+    return demo
+
+
+def film_json(shell, binary):
+    """Build with JSON output and show the recorded trust ids."""
+    demo = Timeline("krabka-evidence — JSON outputs, end to end")
+    cmd = f"export PATH={os.path.dirname(binary)}:$PATH"
+    shell.execute(cmd)
+    demo.command(cmd, 65)
+    cmd = "krabka-evidence fixture --scenario clean --out /tmp/ev-demo-json"
+    out = shell.execute(cmd)
+    assert out == ["wrote /tmp/ev-demo-json/clean"], out
+    demo.command(cmd, 75)
+    demo.output(out)
+    shell.execute("cd /tmp/ev-demo-json/clean")
+    demo.command("cd /tmp/ev-demo-json/clean", 40)
+    cmd = (
+        "krabka-evidence --audit audit --metadata metadata --archive archive "
+        "--operator-keys keys/keys.toml --cluster-id fixture-cluster "
+        "--sign-with keys/auditor.priv.pkcs8 -o evidence --format json "
+        "| python3 -c \"import json,sys; s=json.load(sys.stdin); "
+        "print(s['status'], 'checks:', len(s['checks']))\""
+    )
+    out = shell.execute(cmd)
+    assert out == ["clean checks: 11"], out
+    demo.command(cmd, 110)
+    demo.output(out, stagger=0.1)
+    cmd = (
+        "krabka-evidence verify evidence --format json "
+        "| python3 -c \"import json,sys; s=json.load(sys.stdin); "
+        "print(s['authentic'], s['findings'])\""
+    )
+    out = shell.execute(cmd)
+    assert out == ["True 0"], out
+    demo.command(cmd, 100)
+    demo.output(out)
+    cmd = (
+        "python3 -c \"import json; "
+        "print(json.load(open('evidence/report.json'))['trust']['operator_key_ids'])\""
+    )
+    out = shell.execute(cmd)
+    assert out == ["['alice-2026', 'bob-2026', 'carol-2026']"], out
+    demo.command(cmd, 100)
     demo.output(out)
     return demo
 
@@ -447,6 +530,7 @@ def main():
 
     work = "/tmp/ev-demo-work"
     shutil.rmtree("/tmp/ev-demo", ignore_errors=True)
+    shutil.rmtree("/tmp/ev-demo-json", ignore_errors=True)
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
     out_dir = os.path.join(root, "docs", "demo")
@@ -457,26 +541,53 @@ def main():
     clean_seconds = clean.finish()
     tamper = film_tamper(Shell(root), binary)
     tamper_seconds = tamper.finish()
+    bypass = film_bypass(Shell(root), binary)
+    bypass_seconds = bypass.finish()
+    json_demo = film_json(Shell(root), binary)
+    json_seconds = json_demo.finish(hold=0.7)
 
     clean_mp4 = os.path.join(out_dir, "demo-clean.mp4")
     clean_gif = os.path.join(out_dir, "demo-clean.gif")
     tamper_mp4 = os.path.join(out_dir, "demo-tamper.mp4")
     tamper_gif = os.path.join(out_dir, "demo-tamper.gif")
+    bypass_mp4 = os.path.join(out_dir, "demo-bypass.mp4")
+    bypass_gif = os.path.join(out_dir, "demo-bypass.gif")
+    json_mp4 = os.path.join(out_dir, "demo-json.mp4")
+    json_gif = os.path.join(out_dir, "demo-json.gif")
     render(ffmpeg, font, clean, clean_seconds, work, clean_mp4, clean_gif)
     render(ffmpeg, font, tamper, tamper_seconds, work, tamper_mp4, tamper_gif)
+    render(ffmpeg, font, bypass, bypass_seconds, work, bypass_mp4, bypass_gif)
+    render(ffmpeg, font, json_demo, json_seconds, work, json_mp4, json_gif)
 
     for path, duration in [
         (clean_mp4, clean_seconds),
         (clean_gif, clean_seconds),
         (tamper_mp4, tamper_seconds),
         (tamper_gif, tamper_seconds),
+        (bypass_mp4, bypass_seconds),
+        (bypass_gif, bypass_seconds),
+        (json_mp4, json_seconds),
+        (json_gif, json_seconds),
     ]:
         verify(ffmpeg, ffprobe, path, duration)
     print("--- clean, near the end ---")
     print(ascii_frame(ffmpeg, clean_mp4, clean_seconds - 2.0))
     print("--- tamper, near the end ---")
     print(ascii_frame(ffmpeg, tamper_mp4, tamper_seconds - 2.0))
-    for path in (clean_mp4, clean_gif, tamper_mp4, tamper_gif):
+    print("--- bypass, near the end ---")
+    print(ascii_frame(ffmpeg, bypass_mp4, bypass_seconds - 2.0))
+    print("--- json, near the end ---")
+    print(ascii_frame(ffmpeg, json_mp4, json_seconds - 2.0))
+    for path in (
+        clean_mp4,
+        clean_gif,
+        tamper_mp4,
+        tamper_gif,
+        bypass_mp4,
+        bypass_gif,
+        json_mp4,
+        json_gif,
+    ):
         size = os.path.getsize(path)
         print(f"{size:>10,} bytes  {os.path.relpath(path, root)}")
 

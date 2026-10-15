@@ -180,3 +180,26 @@ Findings:
 
 Related note (filed under `metadata-coverage`): expiry sweeps removing
 proposals the input never held, which retention routinely compacts away.
+
+## Window scoping
+
+Not every check filters by `--from`/`--to`. The per-ledger verifiers and
+the coverage checks always run over the whole input; the joining checks
+fire only inside the window:
+
+| Check | Window filter |
+|---|---|
+| `audit-chain` | None: the whole partition is verified |
+| `audit-loss-windows` | None: every declared loss marker is reported |
+| `worm-archive` | None: the whole archive is verified |
+| `metadata-coverage` | None: floors describe the input, not the window |
+| `applied-with-no-audit-event` | Metadata act time (`set_at_ms` / `consumed_at_ms`) in window |
+| `audited-action-not-in-metadata` | Audit event emit time in window |
+| `signature-verification` | None: every signature on both ledgers is verified |
+| `two-person-rule` | None: every proposal is graded |
+| `bypass-listing` | Audit emit time / proposal consumed time in window |
+| `approver-set-change` | Audit event emit time in window |
+| `gated-operation-without-approval` | Admin op emit time in window |
+
+A window where `--from` equals `--to` is empty; the report notes it, and
+the window-scoped checks cannot fire.

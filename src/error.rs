@@ -52,6 +52,13 @@ pub enum EvidenceError {
         /// What was wrong with the window.
         reason: String,
     },
+    /// A flag combination is malformed (missing required flags, unknown ids,
+    /// bad values, output nesting with an input).
+    #[error("bad flag: {reason}")]
+    BadFlag {
+        /// What was wrong with the flags.
+        reason: String,
+    },
 }
 
 impl EvidenceError {

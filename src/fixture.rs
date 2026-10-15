@@ -18,6 +18,20 @@
 //!   forge the operator signature). Exactly one finding.
 //! - `approver-change`: one event carries a different approver-set
 //!   fingerprint. Exactly one finding.
+//! - `corrupt-chain`: the head segment's closing checkpoint signature is
+//!   flipped after sealing. Exactly one finding.
+//! - `expired-approval`: a fifth proposal carries an approval stamped after
+//!   expiry. Exactly one finding.
+//! - `unsigned`: the freeze and one approval carry no signature. No
+//!   findings; the report notes the unattested records.
+//! - `worm-tamper`: a hex digit in a manifest's chain link is flipped.
+//!   Exactly one finding.
+//! - `bypass`: the delete `Applied` event runs `bypassed`. Exactly one
+//!   finding.
+//! - `gated-op`: the gated `DeleteTopic` targets a topic no proposal names.
+//!   Exactly one finding.
+//! - `unknown-key`: the freeze event is signed outside the trust set.
+//!   Exactly one finding.
 
 use std::{
     collections::BTreeMap,
@@ -99,13 +113,19 @@ pub enum Scenario {
     Unsigned,
     /// Flip a hex digit in a WORM manifest's chain link (tamper).
     WormTamper,
+    /// Run the delete `Applied` event with a `bypassed` phase.
+    Bypass,
+    /// Retarget the gated `DeleteTopic` at a topic no proposal names.
+    GatedOp,
+    /// Sign the freeze event with a key outside the trust set.
+    UnknownKey,
 }
 
 impl Scenario {
-    /// Parse a scenario name.
+    /// Parse a scenario name, case-insensitively.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
+        match name.to_ascii_lowercase().as_str() {
             "clean" => Some(Self::Clean),
             "missing-audit" => Some(Self::MissingAudit),
             "flipped-sig" => Some(Self::FlippedSignature),
@@ -114,13 +134,16 @@ impl Scenario {
             "expired-approval" => Some(Self::ExpiredApproval),
             "unsigned" => Some(Self::Unsigned),
             "worm-tamper" => Some(Self::WormTamper),
+            "bypass" => Some(Self::Bypass),
+            "gated-op" => Some(Self::GatedOp),
+            "unknown-key" => Some(Self::UnknownKey),
             _ => None,
         }
     }
 
     /// All scenarios.
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 11] {
         [
             Self::Clean,
             Self::MissingAudit,
@@ -130,6 +153,9 @@ impl Scenario {
             Self::ExpiredApproval,
             Self::Unsigned,
             Self::WormTamper,
+            Self::Bypass,
+            Self::GatedOp,
+            Self::UnknownKey,
         ]
     }
 
@@ -145,6 +171,9 @@ impl Scenario {
             Self::ExpiredApproval => "expired-approval",
             Self::Unsigned => "unsigned",
             Self::WormTamper => "worm-tamper",
+            Self::Bypass => "bypass",
+            Self::GatedOp => "gated-op",
+            Self::UnknownKey => "unknown-key",
         }
     }
 
@@ -183,6 +212,35 @@ impl Scenario {
                 "A hex digit in a WORM manifest's chain link is \
                 flipped. Exactly one finding: archive tampering."
             }
+            Self::Bypass => {
+                "The delete proposal's Applied event runs with a \
+                bypassed phase. Exactly one finding: the action bypassed approval."
+            }
+            Self::GatedOp => {
+                "The gated DeleteTopic targets a topic no proposal \
+                names. Exactly one finding: the op ran without approval."
+            }
+            Self::UnknownKey => {
+                "The freeze event is signed by a key outside the \
+                trust set. Exactly one finding: the key is unknown."
+            }
+        }
+    }
+
+    /// Expected build result: exit code and finding title (`None` when clean).
+    #[must_use]
+    pub const fn expected_outcome(self) -> (i32, Option<&'static str>) {
+        match self {
+            Self::Clean | Self::Unsigned => (0, None),
+            Self::MissingAudit => (1, Some("Applied with no audit event")),
+            Self::FlippedSignature => (1, Some("Signature does not verify")),
+            Self::ApproverChange => (1, Some("Approver set changed")),
+            Self::CorruptChain => (1, Some("Audit hash chain broken")),
+            Self::ExpiredApproval => (1, Some("Two-person rule violated")),
+            Self::WormTamper => (1, Some("WORM archive tamper detected")),
+            Self::Bypass => (1, Some("Gated action bypassed approval")),
+            Self::GatedOp => (1, Some("Gated op without approval")),
+            Self::UnknownKey => (1, Some("Unknown key")),
         }
     }
 }
@@ -226,11 +284,17 @@ struct FixtureKeys {
 /// checkpoint, with minimal metadata and archive inputs alongside.
 ///
 /// Throughput tests use this to prove the 10M-records-in-5-minutes budget.
+/// With a seed, every key derives deterministically, so two runs with the
+/// same seed produce identical bytes.
 ///
 /// # Errors
 ///
 /// Returns [`EvidenceError::OutputUnwritable`] when files cannot be written.
-pub fn generate_bulk_audit(out: &Path, events: usize) -> Result<FixturePaths, EvidenceError> {
+pub fn generate_bulk_audit(
+    out: &Path,
+    events: usize,
+    seed: Option<&str>,
+) -> Result<FixturePaths, EvidenceError> {
     let root = out.to_path_buf();
     let audit_dir = root.join("audit");
     let metadata_dir = root.join("metadata");
@@ -242,8 +306,8 @@ pub fn generate_bulk_audit(out: &Path, events: usize) -> Result<FixturePaths, Ev
             source: source.into(),
         })?;
     }
-    let keys = mint_keys(None)?;
-    write_keys(&keys, &keys_dir, None)?;
+    let keys = mint_keys(seed)?;
+    write_keys(&keys, &keys_dir, seed)?;
 
     let product = ProductInfo {
         vendor_name: "krabka".to_string(),
@@ -396,8 +460,13 @@ pub async fn generate_scenario(
 
 /// The `README.txt` describing one scenario.
 fn scenario_readme(scenario: Scenario) -> String {
+    let (exit, finding) = scenario.expected_outcome();
+    let expected = finding.map_or_else(
+        || "clean (no findings)".to_string(),
+        |title| format!("exactly one finding: {title}"),
+    );
     format!(
-        "krabka-evidence fixture: {}\n\n{}\n\nInputs: audit/ metadata/ archive/ keys/keys.toml\n",
+        "krabka-evidence fixture: {}\n\n{}\n\nExpected: exit {exit} -- {expected}.\n\nInputs: audit/ metadata/ archive/ keys/keys.toml\n",
         scenario.dir_name(),
         scenario.description(),
     )
@@ -937,6 +1006,18 @@ fn write_audit(
         let victim = usize::try_from(DELETE_APPLIED_INDEX).unwrap_or(0);
         set_fingerprint(&mut serialized[victim], &drifted)?;
     }
+    if scenario == Scenario::Bypass {
+        let victim = usize::try_from(DELETE_APPLIED_INDEX).unwrap_or(0);
+        set_phase(&mut serialized[victim], "bypassed")?;
+    }
+    if scenario == Scenario::GatedOp {
+        let victim = serialized.len().saturating_sub(1);
+        set_admin_resource_name(&mut serialized[victim], "ghost")?;
+    }
+    if scenario == Scenario::UnknownKey {
+        let victim = usize::try_from(FREEZE_APPLIED_OFFSET).unwrap_or(0);
+        set_key_id(&mut serialized[victim], "mallory-2099")?;
+    }
     if unsigned {
         // The freeze and the first thaw approval go out unattested.
         for index in [0, 1, 3] {
@@ -1473,14 +1554,45 @@ fn strip_signature(record: &mut AuditRecord) -> Result<(), EvidenceError> {
 
 /// Replace a record's OCSF approver-set fingerprint.
 fn set_fingerprint(record: &mut AuditRecord, fingerprint: &str) -> Result<(), EvidenceError> {
+    set_privileged_field(record, "approver_set_fingerprint", fingerprint)
+}
+
+/// Replace a record's OCSF privileged-action phase.
+fn set_phase(record: &mut AuditRecord, phase: &str) -> Result<(), EvidenceError> {
+    set_privileged_field(record, "phase", phase)
+}
+
+/// Replace a record's OCSF privileged-action key id.
+fn set_key_id(record: &mut AuditRecord, key_id: &str) -> Result<(), EvidenceError> {
+    set_privileged_field(record, "key_id", key_id)
+}
+
+/// Set one `/privileged_action` string field on a record's OCSF body.
+fn set_privileged_field(
+    record: &mut AuditRecord,
+    field: &str,
+    value: &str,
+) -> Result<(), EvidenceError> {
     let mut json: serde_json::Value = serde_json::from_slice(&record.value).map_err(|source| {
         EvidenceError::OutputUnwritable {
             path: Path::new("<fixture>").to_path_buf(),
             source: source.into(),
         }
     })?;
-    json["privileged_action"]["approver_set_fingerprint"] =
-        serde_json::Value::String(fingerprint.to_string());
+    json["privileged_action"][field] = serde_json::Value::String(value.to_string());
+    record.value = serde_json::to_vec(&json).unwrap_or_default();
+    Ok(())
+}
+
+/// Rename the first resource of an admin-operation record.
+fn set_admin_resource_name(record: &mut AuditRecord, name: &str) -> Result<(), EvidenceError> {
+    let mut json: serde_json::Value = serde_json::from_slice(&record.value).map_err(|source| {
+        EvidenceError::OutputUnwritable {
+            path: Path::new("<fixture>").to_path_buf(),
+            source: source.into(),
+        }
+    })?;
+    json["resources"][0]["name"] = serde_json::Value::String(name.to_string());
     record.value = serde_json::to_vec(&json).unwrap_or_default();
     Ok(())
 }

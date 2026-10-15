@@ -13,7 +13,7 @@ use krabka_evidence::{
     checks::{CheckInputs, run_cross_checks},
     cli::{Cli, Command, OutputFormat},
     error::{EvidenceError, ExitCode},
-    finding::{CheckId, CheckStatus, Finding, Note},
+    finding::{CheckId, CheckStatus, Finding, Note, sort_findings, sort_notes},
     fixture::{FixtureOptions, Scenario, generate_bulk_audit, generate_scenario},
     hash::digest_path,
     keys::{CliKeyPair, TrustMaterial, load_trust},
@@ -25,6 +25,7 @@ use krabka_evidence::{
     signing::{generate_auditor_key, sign_canonical_bytes},
     timeline::{TimelineRow, Window, build_timeline, parse_window, truncate_timeline},
 };
+use krabka_remote_storage::ChainHead;
 
 /// Run the CLI.
 #[tokio::main]
@@ -56,26 +57,50 @@ async fn main() -> std::process::ExitCode {
 /// Build a pack from ledger copies.
 async fn run_build(args: krabka_evidence::cli::BuildArgs) -> std::process::ExitCode {
     if args.selection.list_checks {
-        for id in ALL_CHECKS {
-            println!("{} - {}", id.kebab(), id.title());
+        if matches!(args.verbosity.format, OutputFormat::Json) {
+            println!(
+                "{}",
+                serde_json::json!(
+                    ALL_CHECKS
+                        .iter()
+                        .map(|id| serde_json::json!({"id": id.kebab(), "title": id.title()}))
+                        .collect::<Vec<_>>()
+                )
+            );
+        } else {
+            for id in ALL_CHECKS {
+                println!("{} - {}", id.kebab(), id.title());
+            }
         }
         return ExitCode::Clean.into();
     }
     let quiet = args.verbosity.quiet;
     let json = matches!(args.verbosity.format, OutputFormat::Json);
+    let verbose = args.verbosity.verbose;
+    let started = std::time::Instant::now();
     match build_pack(args).await {
         Ok(outcome) => {
+            if verbose {
+                eprintln!("elapsed: {:.2}s", started.elapsed().as_secs_f64());
+            }
             if quiet {
                 // The exit code is the answer.
             } else if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "status": if outcome.findings == 0 { "clean" } else { "findings" },
+                        "status": if outcome.findings > 0 {
+                            "findings"
+                        } else if outcome.require_failed {
+                            "not-checked"
+                        } else {
+                            "clean"
+                        },
                         "findings": outcome.findings,
                         "notes": outcome.notes,
                         "pack": outcome.pack,
                         "not_checked": outcome.not_checked,
+                        "checks": outcome.checks,
                     })
                 );
             } else if outcome.findings == 0 {
@@ -109,6 +134,7 @@ struct BuildOutcome {
     pack: String,
     not_checked: usize,
     require_failed: bool,
+    checks: Vec<krabka_evidence::report::CheckSummary>,
 }
 
 /// Required paths, unwrapped from the CLI options once.
@@ -127,6 +153,7 @@ struct BuildContext {
     only: Option<HashSet<CheckId>>,
     trust: TrustMaterial,
     dirs: LedgerDirs,
+    expect_head: Option<ChainHead>,
 }
 
 impl BuildContext {
@@ -134,6 +161,19 @@ impl BuildContext {
     fn resolve(args: &krabka_evidence::cli::BuildArgs) -> Result<Self, EvidenceError> {
         let window = parse_window(args.from.as_deref(), args.to.as_deref())?;
         let only = parse_only(args.selection.only.as_deref())?;
+        let expect_head = args
+            .expect_head
+            .as_deref()
+            .map(parse_chain_head)
+            .transpose()
+            .map_err(|reason| EvidenceError::BadFlag {
+                reason: format!("--expect-head: {reason}"),
+            })?;
+        if args.limits.max_timeline_rows == 0 {
+            return Err(EvidenceError::BadFlag {
+                reason: "--max-timeline-rows must be at least 1".to_string(),
+            });
+        }
         let keys = require("--operator-keys", args.operator_keys.clone())?;
         let trust = load_cli_trust(args, &keys)?;
         let dirs = LedgerDirs {
@@ -149,11 +189,13 @@ impl BuildContext {
             &[&dirs.audit, &dirs.metadata, &dirs.keys],
             &dirs.archive_raw,
         )?;
+        refuse_nonempty_output(&dirs.out, args.overwrite)?;
         Ok(Self {
             window,
             only,
             trust,
             dirs,
+            expect_head,
         })
     }
 }
@@ -237,17 +279,27 @@ async fn verify_worm_input(
         args.s3_endpoint.clone(),
         args.allow_http,
     )?;
-    let expect_head = args
-        .expect_head
-        .as_deref()
-        .map(parse_chain_head)
-        .transpose()
-        .map_err(|reason| EvidenceError::BadWindow { reason })?;
+    if verbose {
+        if archive_spec.label.starts_with("s3://") {
+            eprintln!(
+                "archive: verifying {} (region {}{})",
+                archive_spec.label,
+                args.s3_region,
+                args.s3_endpoint
+                    .as_deref()
+                    .map_or(String::new(), |endpoint| {
+                        format!(", endpoint {endpoint}")
+                    }),
+            );
+        } else {
+            eprintln!("archive: verifying {}", archive_spec.label);
+        }
+    }
     let grading = WormGrading {
         deep: args.worm_grading.deep,
         strict_orphans: args.worm_grading.strict_orphans,
         allow_epoch_restarts: args.worm_grading.allow_epoch_restarts,
-        expect_head,
+        expect_head: context.expect_head,
     };
     let (worm_report, mut worm_findings, mut worm_notes) = if args.limits.archive_timeout_secs == 0
     {
@@ -290,6 +342,13 @@ fn check_phase(
     findings: &mut Vec<Finding>,
     notes: &mut Vec<Note>,
 ) -> (Vec<TimelineRow>, bool) {
+    if context.window.from_ms == context.window.to_ms {
+        notes.push(Note::new(
+            CheckId::MetadataCoverage,
+            "the requested window is empty (--from equals --to): no event falls \
+             inside it, so window-scoped checks cannot fire",
+        ));
+    }
     let timeline_full = build_timeline(&ledgers.audit, &ledgers.metadata);
     let (timeline, truncated) = truncate_timeline(timeline_full, args.limits.max_timeline_rows);
     if truncated {
@@ -321,8 +380,8 @@ fn check_phase(
             }
         }
     }
-    findings.sort_by_key(finding_order);
-    notes.sort_by(|a, b| format!("{:?}", a.check).cmp(&format!("{:?}", b.check)));
+    sort_findings(findings);
+    sort_notes(notes);
     (timeline, truncated)
 }
 
@@ -373,6 +432,9 @@ fn finish_pack_phase(
             operators: context.trust.operator_count,
             audit: context.trust.audit_count,
             worm: context.trust.worm_count,
+            operator_key_ids: context.trust.operator_key_ids.clone(),
+            audit_key_ids: context.trust.audit_key_ids.clone(),
+            worm_key_ids: context.trust.worm_key_ids.clone(),
         },
         timeline_truncated: truncated,
         auditor: AuditorIdentity {
@@ -403,14 +465,18 @@ fn finish_pack_phase(
         pack: context.dirs.out.to_string_lossy().to_string(),
         not_checked,
         require_failed,
+        checks: report.checks,
     })
 }
 
 /// Parse `--only` into a check set.
 ///
+/// Ids match case-insensitively, and empty segments are ignored, so
+/// `--only Audit-Chain,,WORM-ARCHIVE` selects two checks.
+///
 /// # Errors
 ///
-/// Returns [`EvidenceError::BadWindow`] when an id is unknown.
+/// Returns [`EvidenceError::BadFlag`] when an id is unknown or no id is given.
 fn parse_only(
     only: Option<&str>,
 ) -> Result<Option<std::collections::HashSet<CheckId>>, EvidenceError> {
@@ -420,12 +486,15 @@ fn parse_only(
     let mut set = std::collections::HashSet::new();
     for raw in list.split(',') {
         let id = raw.trim();
-        match CheckId::from_kebab(id) {
+        if id.is_empty() {
+            continue;
+        }
+        match CheckId::from_kebab(&id.to_ascii_lowercase()) {
             Some(check) => {
                 set.insert(check);
             }
             None => {
-                return Err(EvidenceError::BadWindow {
+                return Err(EvidenceError::BadFlag {
                     reason: format!(
                         "unknown check {id:?}; run with --list-checks to see the check ids"
                     ),
@@ -434,7 +503,7 @@ fn parse_only(
         }
     }
     if set.is_empty() {
-        return Err(EvidenceError::BadWindow {
+        return Err(EvidenceError::BadFlag {
             reason: "--only needs at least one check id".to_string(),
         });
     }
@@ -449,13 +518,19 @@ fn parse_only(
 ///
 /// # Errors
 ///
-/// Returns [`EvidenceError::BadWindow`] when the output nests with an input.
+/// Returns [`EvidenceError::BadFlag`] when the output nests with an input.
 fn refuse_output_inside_input(
     out_dir: &std::path::Path,
     input_dirs: &[&std::path::Path],
     archive_raw: &str,
 ) -> Result<(), EvidenceError> {
     let anchor = |path: &std::path::Path| {
+        // Canonicalize what exists, so `audit/../evidence` cannot dodge the
+        // comparison lexically; fall back to a plain absolute join for paths
+        // that do not exist yet (typically the output).
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return canonical;
+        }
         if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -469,7 +544,7 @@ fn refuse_output_inside_input(
     }
     for input in inputs {
         if out == input || out.starts_with(&input) || input.starts_with(&out) {
-            return Err(EvidenceError::BadWindow {
+            return Err(EvidenceError::BadFlag {
                 reason: format!(
                     "refusing to write the pack to {}: it nests with the input {}",
                     out_dir.display(),
@@ -477,6 +552,26 @@ fn refuse_output_inside_input(
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+/// Refuse to write into a non-empty output directory without `--overwrite`.
+///
+/// A resumed or mistaken `-o` pointing at an older pack (or any directory
+/// with files) would otherwise silently mix two packs' files.
+fn refuse_nonempty_output(out_dir: &std::path::Path, overwrite: bool) -> Result<(), EvidenceError> {
+    if overwrite || !out_dir.is_dir() {
+        return Ok(());
+    }
+    let nonempty = std::fs::read_dir(out_dir).is_ok_and(|mut entries| entries.next().is_some());
+    if nonempty {
+        return Err(EvidenceError::BadFlag {
+            reason: format!(
+                "output {} exists and is not empty (pass --overwrite to reuse it)",
+                out_dir.display()
+            ),
+        });
     }
     Ok(())
 }
@@ -514,22 +609,16 @@ fn error_hint(error: &EvidenceError) -> Option<String> {
              after --to"
                 .to_string(),
         ),
+        EvidenceError::BadFlag { .. } => {
+            Some("run with --help to see the required flags and the values they take".to_string())
+        }
         _ => None,
     }
 }
 
-/// Sort findings by check, then offsets, for a stable report.
-fn finding_order(finding: &Finding) -> (String, i64, i64) {
-    (
-        format!("{:?}", finding.check),
-        finding.audit_offset.unwrap_or(i64::MAX),
-        finding.metadata_offset.unwrap_or(i64::MAX),
-    )
-}
-
 /// Require a build flag.
 fn require<T>(flag: &str, value: Option<T>) -> Result<T, EvidenceError> {
-    value.ok_or_else(|| EvidenceError::BadWindow {
+    value.ok_or_else(|| EvidenceError::BadFlag {
         reason: format!("{flag} is required to build a report"),
     })
 }
@@ -540,7 +629,7 @@ fn load_cli_trust(
     keys_path: &std::path::Path,
 ) -> Result<krabka_evidence::keys::TrustMaterial, EvidenceError> {
     if args.worm_key_id.len() != args.worm_public_key.len() {
-        return Err(EvidenceError::BadWindow {
+        return Err(EvidenceError::BadFlag {
             reason: "--worm-key-id and --worm-public-key must pair by position".to_string(),
         });
     }
@@ -551,7 +640,7 @@ fn load_cli_trust(
         }],
         (None, None) => Vec::new(),
         _ => {
-            return Err(EvidenceError::BadWindow {
+            return Err(EvidenceError::BadFlag {
                 reason: "--audit-key-id and --audit-public-key must be given together".to_string(),
             });
         }
@@ -627,6 +716,50 @@ fn digest_inputs(
     Ok((digests, file_hashes))
 }
 
+/// Compare a `--auditor-public-key` pin file against the embedded hex key.
+///
+/// The file holds either the raw 32-byte key or 64 hex characters
+/// (surrounding whitespace tolerated). A missing or unreadable file is an
+/// error, never a silent mismatch.
+fn pin_matches(pinned: &std::path::Path, embedded_hex: &str) -> Result<bool, String> {
+    let bytes = std::fs::read(pinned)
+        .map_err(|source| format!("cannot read auditor pin {}: {source}", pinned.display()))?;
+    let decoded = if bytes.len() == 32 {
+        bytes
+    } else {
+        let text = std::str::from_utf8(&bytes).unwrap_or_default();
+        hex::decode(text.trim()).unwrap_or_default()
+    };
+    let embedded = hex::decode(embedded_hex.trim()).unwrap_or_default();
+    Ok(!embedded.is_empty() && decoded == embedded)
+}
+
+/// Enforce `--auditor-public-key` pinning against the embedded auditor key.
+///
+/// Returns the exit code when the pin mismatches (exit 1) or cannot be read
+/// (exit 2); `None` means verification continues.
+fn enforce_auditor_pin(
+    pinned: Option<&PathBuf>,
+    report: &krabka_evidence::report::EvidenceReport,
+    quiet: bool,
+) -> Option<std::process::ExitCode> {
+    let pinned = pinned?;
+    match pin_matches(pinned, &report.auditor.public_key_hex) {
+        Ok(true) => None,
+        Ok(false) => {
+            if !quiet {
+                eprintln!("FAIL: pack auditor key does not match --auditor-public-key");
+            }
+            Some(ExitCode::Findings.into())
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            eprintln!("hint: pass the raw 32-byte auditor .pub file or its 64-char hex encoding");
+            Some(ExitCode::Unreadable.into())
+        }
+    }
+}
+
 /// Verify a pack.
 fn run_verify(args: &krabka_evidence::cli::VerifyArgs) -> std::process::ExitCode {
     let json = matches!(args.output.format, OutputFormat::Json);
@@ -656,18 +789,12 @@ fn run_verify(args: &krabka_evidence::cli::VerifyArgs) -> std::process::ExitCode
                 }
                 return ExitCode::Findings.into();
             }
-            if let Some(pinned) = &args.auditor_public_key {
-                let pinned_bytes = std::fs::read(pinned).unwrap_or_default();
-                let embedded =
-                    hex::decode(pack.report.auditor.public_key_hex.trim()).unwrap_or_default();
-                if pinned_bytes != embedded {
-                    if !quiet {
-                        eprintln!("FAIL: pack auditor key does not match --auditor-public-key");
-                    }
-                    return ExitCode::Findings.into();
-                }
+            if let Some(code) =
+                enforce_auditor_pin(args.auditor_public_key.as_ref(), &pack.report, quiet)
+            {
+                return code;
             }
-            if let Some(code) = rehash_verify_inputs(args, &pack.report) {
+            if let Some(code) = rehash_verify_inputs(args, &pack.report, json) {
                 return code;
             }
             if args.fail_on_findings && pack.report.counts.findings > 0 {
@@ -698,6 +825,7 @@ fn run_verify(args: &krabka_evidence::cli::VerifyArgs) -> std::process::ExitCode
                             "authentic": true,
                             "findings": pack.report.counts.findings,
                             "notes": pack.report.counts.notes,
+                            "checks": pack.report.checks,
                         })
                     );
                 } else {
@@ -737,45 +865,85 @@ fn run_verify(args: &krabka_evidence::cli::VerifyArgs) -> std::process::ExitCode
 fn rehash_verify_inputs(
     args: &krabka_evidence::cli::VerifyArgs,
     report: &krabka_evidence::report::EvidenceReport,
+    json: bool,
 ) -> Option<std::process::ExitCode> {
-    for (slot, path) in [("audit", &args.audit), ("metadata", &args.metadata)]
-        .iter()
-        .filter_map(|(slot, path)| path.as_ref().map(|path| (*slot, path)))
+    for (slot, path) in [
+        ("audit", &args.audit),
+        ("metadata", &args.metadata),
+        ("operator_keys", &args.operator_keys),
+    ]
+    .iter()
+    .filter_map(|(slot, path)| path.as_ref().map(|path| (*slot, path)))
     {
         match digest_path(path, slot) {
             Ok(digest) => {
                 let expected = report.inputs.get(slot).map(|input| &input.digest);
                 if expected != Some(&digest.digest) {
-                    eprintln!("FAIL: {slot} input digest differs from the pack's record");
+                    rehash_mismatch(slot, json);
                     return Some(ExitCode::Findings.into());
                 }
             }
             Err(error) => {
-                eprintln!("error: {error}");
+                rehash_error(slot, &error, json);
                 return Some(ExitCode::Unreadable.into());
             }
         }
     }
     if let Some(archive) = &args.archive {
         if archive.starts_with("s3://") {
-            eprintln!("note: remote archives cannot be re-hashed; skipping");
+            if !args.output.quiet {
+                eprintln!("note: remote archives cannot be re-hashed; skipping");
+            }
         } else {
             match digest_path(&PathBuf::from(archive), "archive") {
                 Ok(digest) => {
                     let expected = report.inputs.get("archive").map(|input| &input.digest);
                     if expected != Some(&digest.digest) {
-                        eprintln!("FAIL: archive input digest differs from the pack's record");
+                        rehash_mismatch("archive", json);
                         return Some(ExitCode::Findings.into());
                     }
                 }
                 Err(error) => {
-                    eprintln!("error: {error}");
+                    rehash_error("archive", &error, json);
                     return Some(ExitCode::Unreadable.into());
                 }
             }
         }
     }
     None
+}
+
+/// Report a re-hash digest mismatch in the requested output shape.
+fn rehash_mismatch(slot: &str, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "authentic": true,
+                "rehash": "mismatch",
+                "slot": slot,
+            })
+        );
+    } else {
+        eprintln!("FAIL: {slot} input digest differs from the pack's record");
+    }
+}
+
+/// Report a re-hash read failure in the requested output shape.
+fn rehash_error(slot: &str, error: &EvidenceError, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "authentic": true,
+                "rehash": "error",
+                "slot": slot,
+                "reason": error.to_string(),
+            })
+        );
+    } else {
+        eprintln!("error: {error}");
+    }
 }
 
 /// Mint an auditor key.
@@ -785,6 +953,12 @@ fn run_keygen(args: &krabka_evidence::cli::KeygenArgs) -> std::process::ExitCode
             let prefix = args.out.to_string_lossy().to_string();
             let private_path = PathBuf::from(format!("{prefix}.priv.pkcs8"));
             let public_path = PathBuf::from(format!("{prefix}.pub"));
+            if !args.force && (private_path.exists() || public_path.exists()) {
+                eprintln!(
+                    "error: key files already exist for {prefix} (pass --force to overwrite them)"
+                );
+                return ExitCode::Unreadable.into();
+            }
             if let Err(error) = std::fs::write(&private_path, &keypair.private_pkcs8)
                 .and_then(|()| std::fs::write(&public_path, &keypair.public_key))
             {
@@ -806,9 +980,30 @@ fn run_keygen(args: &krabka_evidence::cli::KeygenArgs) -> std::process::ExitCode
 
 /// Generate fixtures.
 async fn run_fixture(args: &krabka_evidence::cli::FixtureArgs) -> std::process::ExitCode {
-    if args.scenario == "bulk" {
+    if args.list_scenarios {
+        for scenario in Scenario::all() {
+            println!("{} - {}", scenario.dir_name(), scenario.description());
+        }
+        return ExitCode::Clean.into();
+    }
+    if args.out.exists() && !args.out.is_dir() {
+        eprintln!(
+            "error: fixture --out {} exists and is not a directory",
+            args.out.display()
+        );
+        return ExitCode::Unreadable.into();
+    }
+    if args.scenario.eq_ignore_ascii_case("bulk") {
+        if args.events == 0 {
+            eprintln!("error: fixture --events must be at least 1");
+            return ExitCode::Unreadable.into();
+        }
+        if args.layout != "segments" {
+            eprintln!("error: --layout capture only applies to ledger scenarios, not to bulk");
+            return ExitCode::Unreadable.into();
+        }
         let out = args.out.join("bulk");
-        match generate_bulk_audit(&out, args.events) {
+        match generate_bulk_audit(&out, args.events, args.seed.as_deref()) {
             Ok(paths) => {
                 println!("wrote {}", paths.root.display());
                 return ExitCode::Clean.into();
@@ -826,7 +1021,7 @@ async fn run_fixture(args: &krabka_evidence::cli::FixtureArgs) -> std::process::
         );
         return ExitCode::Unreadable.into();
     }
-    let scenarios: Vec<Scenario> = if args.scenario == "all" {
+    let scenarios: Vec<Scenario> = if args.scenario.eq_ignore_ascii_case("all") {
         Scenario::all().to_vec()
     } else if let Some(scenario) = Scenario::from_name(&args.scenario) {
         vec![scenario]
@@ -834,7 +1029,7 @@ async fn run_fixture(args: &krabka_evidence::cli::FixtureArgs) -> std::process::
         eprintln!(
             "error: unknown scenario {:?}; want clean, missing-audit, flipped-sig, \
              approver-change, corrupt-chain, expired-approval, unsigned, worm-tamper, \
-             bulk, or all",
+             bypass, gated-op, unknown-key, bulk, or all",
             args.scenario
         );
         return ExitCode::Unreadable.into();

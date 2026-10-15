@@ -10,7 +10,10 @@
 //! at all; the report says so explicitly, and the data-record hash links are
 //! still re-verified with the public [`krabka_audit::chain`] primitives.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use krabka_audit::{
     Checkpoint,
@@ -147,6 +150,12 @@ pub fn read_audit_ledger(
         )
     })?;
     let rows = decode_partition(dir, max_segment_bytes, notes)?;
+    if rows.is_empty() {
+        notes.push(Note::new(
+            CheckId::AuditChain,
+            "audit input decoded 0 records: the partition holds no decodable audit events",
+        ));
+    }
 
     if report.ok {
         emit_loss_findings(&report, &rows, findings);
@@ -359,10 +368,22 @@ pub fn decode_partition(
         ));
     }
     let mut rows = Vec::new();
+    let mut undecodable: u64 = 0;
     for (offset, record) in &walk.records {
         if let Some(row) = decode_record(record, *offset) {
             rows.push(row);
+        } else {
+            undecodable += 1;
         }
+    }
+    if undecodable > 0 {
+        notes.push(Note::new(
+            CheckId::AuditChain,
+            format!(
+                "{undecodable} audit record(s) could not be decoded (empty or undecodable \
+                 bodies): they are excluded from the timeline and cross-checks"
+            ),
+        ));
     }
     Ok(rows)
 }
@@ -387,6 +408,23 @@ pub struct SegmentWalk {
     pub truncations: Vec<SegmentTruncation>,
 }
 
+/// Sort ledger files by numeric stem when both stems parse as base offsets.
+///
+/// Segment names are usually zero-padded (`00000000000000000013.log`), which
+/// sorts the same lexically — but an unpadded `9.log` must still come before
+/// `10.log`. Non-numeric names fall back to lexical order.
+pub fn sort_ledger_files(paths: &mut [PathBuf]) {
+    paths.sort_by(|a, b| match (numeric_stem(a), numeric_stem(b)) {
+        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.cmp(b)),
+        _ => a.cmp(b),
+    });
+}
+
+/// A ledger file's stem as a base offset, when it parses as one.
+fn numeric_stem(path: &Path) -> Option<i64> {
+    path.file_stem()?.to_str()?.parse::<i64>().ok()
+}
+
 /// Walk `*.log` segments in filename order.
 ///
 /// The framing mirrors `verify_partition_dir`: concatenated `RecordBatch`
@@ -409,7 +447,7 @@ fn walk_records(dir: &Path, max_segment_bytes: u64) -> Result<SegmentWalk, Evide
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
         .collect();
-    segments.sort();
+    sort_ledger_files(&mut segments);
 
     let mut records = Vec::new();
     let mut truncations = Vec::new();

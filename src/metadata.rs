@@ -120,6 +120,7 @@ pub fn read_metadata_ledger(
 
     for snapshot in &snapshots {
         let end = snapshot_end_offset(snapshot);
+        note_unparsed_snapshot_name(snapshot, notes);
         let (mut snap_rows, decoded, skipped) =
             decode_snapshot(snapshot, &mut image, Some(end), max_segment_bytes, notes)?;
         decoded_records += decoded;
@@ -159,6 +160,8 @@ pub fn read_metadata_ledger(
 
     rows.sort_by_key(|row| row.offset);
 
+    note_empty_ledger(&rows, notes);
+
     if skipped_records > 0 {
         notes.push(Note::new(
             CheckId::MetadataCoverage,
@@ -183,6 +186,31 @@ pub fn read_metadata_ledger(
         decoded_records,
         coverage_floor,
     })
+}
+
+/// Note a snapshot whose file name carries no parsable end offset.
+fn note_unparsed_snapshot_name(snapshot: &Path, notes: &mut Vec<Note>) {
+    if snapshot_end_offset_parsed(snapshot).is_none() {
+        notes.push(Note::new(
+            CheckId::MetadataCoverage,
+            format!(
+                "metadata snapshot {} carries no parsable end offset in its name; \
+                 history before it is treated as fully compacted",
+                snapshot.display()
+            ),
+        ));
+    }
+}
+
+/// Note a metadata input with no freeze or break-glass records.
+fn note_empty_ledger(rows: &[MetadataRow], notes: &mut Vec<Note>) {
+    if rows.is_empty() {
+        notes.push(Note::new(
+            CheckId::MetadataCoverage,
+            "metadata input holds no freeze or break-glass records: the cross-checks \
+             have nothing to corroborate",
+        ));
+    }
 }
 
 /// Read a metadata file, refusing files over the cap.
@@ -327,7 +355,7 @@ fn list_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>, EvidenceError
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == extension))
         .collect();
-    files.sort();
+    crate::audit::sort_ledger_files(&mut files);
     Ok(files)
 }
 
@@ -368,13 +396,17 @@ fn list_capture_snapshots(dir: &Path) -> Result<Vec<PathBuf>, EvidenceError> {
 }
 
 /// Parse the end offset from a `<end:020>-<epoch:010>.checkpoint` name.
-///
-/// Falls back to `i64::MAX` when the name does not parse, so an unknown
-/// snapshot conservatively floors the whole history.
-fn snapshot_end_offset(path: &Path) -> i64 {
+fn snapshot_end_offset_parsed(path: &Path) -> Option<i64> {
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .and_then(|stem| stem.split('-').next())
         .and_then(|end| end.parse::<i64>().ok())
-        .unwrap_or(i64::MAX)
+}
+
+/// Parse the end offset from a `<end:020>-<epoch:010>.checkpoint` name.
+///
+/// Falls back to `i64::MAX` when the name does not parse, so an unknown
+/// snapshot conservatively floors the whole history.
+fn snapshot_end_offset(path: &Path) -> i64 {
+    snapshot_end_offset_parsed(path).unwrap_or(i64::MAX)
 }

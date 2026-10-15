@@ -44,6 +44,7 @@ fn empty_trust() -> TrustMaterial {
         operator_count: 0,
         audit_count: 0,
         worm_count: 0,
+        ..Default::default()
     }
 }
 
@@ -498,7 +499,7 @@ fn loss_marker_past_verifier_stop_is_found_from_rows() {
 fn partition_without_checkpoints_gets_no_anchor_finding() {
     let dir = std::env::temp_dir().join(format!("krabka-evidence-noanchor-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let paths = generate_bulk_audit(&dir.join("bulk"), 5).expect("bulk fixtures generate");
+    let paths = generate_bulk_audit(&dir.join("bulk"), 5, None).expect("bulk fixtures generate");
     let segment = paths.audit.join("00000000000000000000.log");
     let bytes = std::fs::read(&segment).expect("bulk segment reads");
     let mut cursor: &[u8] = &bytes;
@@ -521,4 +522,47 @@ fn partition_without_checkpoints_gets_no_anchor_finding() {
             .any(|finding| finding.title == "Audit chain has no signed anchor"),
         "no-anchor finding present: {findings:?}"
     );
+}
+
+/// #I8: bypass-phase matching ignores case.
+#[test]
+fn bypass_phase_matches_case_insensitively() {
+    let trust = empty_trust();
+    let mut event = privileged();
+    event.phase = "BYPASSED".to_string();
+    let (findings, _) = run_checks(vec![audit_row(0, 1000, event)], Vec::new(), &trust, None);
+    assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+    assert_eq!(findings[0].title, "Gated action bypassed approval");
+}
+
+/// #I8: audit-only matching ignores case, on both ledgers.
+#[test]
+fn audit_only_reason_matches_case_insensitively() {
+    let trust = empty_trust();
+    let mut event = privileged();
+    event.action = "UNCLEAN_RECOVERY".to_string();
+    event.reason = "background_unclean_recovery=AUDIT-ONLY".to_string();
+    let (findings, _) = run_checks(vec![audit_row(0, 1000, event)], Vec::new(), &trust, None);
+    assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+    assert_eq!(findings[0].title, "Unclean recovery ran audit-only");
+
+    let proposal_id = "55555555-5555-5555-5555-555555555555";
+    let mut consumed = proposal(proposal_id);
+    consumed.action = BreakGlassAction::UncleanRecovery;
+    consumed.consumed_at_ms = 1500;
+    consumed.reason = "ran with AUDIT-ONLY recovery".to_string();
+    consumed.approvals = vec![approval("User:bob", 1000), approval("User:carol", 1200)];
+    let mut consumed_event = privileged();
+    consumed_event.phase = "consumed".to_string();
+    consumed_event.action = "unclean_recovery".to_string();
+    consumed_event.proposal_id = proposal_id.to_string();
+    consumed_event.reason = "test".to_string();
+    let (findings, _) = run_checks(
+        vec![audit_row(0, 1500, consumed_event)],
+        vec![meta_row(0, RelevantRecord::Proposal(consumed))],
+        &trust,
+        None,
+    );
+    assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+    assert_eq!(findings[0].title, "Unclean recovery ran audit-only");
 }

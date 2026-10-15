@@ -27,7 +27,9 @@ The fixture scenarios pin the adversarial cases: `flipped-sig` (an
 attacker who rewrote the audit chain but could not forge the operator
 signature), `corrupt-chain` (a broken checkpoint signature),
 `worm-tamper` (a rewritten manifest link), `approver-change` (a drifted
-approver set), `missing-audit` (a deleted tail segment).
+approver set), `missing-audit` (a deleted tail segment), `bypass` (an
+action that ran without approval), `gated-op` (a deletion no proposal
+covers), and `unknown-key` (a signature from outside the trust set).
 
 ## Trust roots (assumed, not proven)
 
@@ -42,7 +44,8 @@ approver set), `missing-audit` (a deleted tail segment).
 - **The copies.** The tool checks the bytes it is given. Tampering that
   happened *before* the copy (on the broker, in transit to the copy) is
   out of scope by construction — the digests bind the pack to the copies,
-  not to the live cluster.
+  not to the live cluster. Symlinks inside the copies are skipped, never
+  followed, so resolve them to real files first.
 - **The window.** Findings only fire inside `--from`/`--to`. A clean pack
   for September says nothing about August; check `report.json`'s `window`
   before citing a pack.
@@ -82,8 +85,10 @@ approver set), `missing-audit` (a deleted tail segment).
 ## Residual risks, ranked
 
 1. A substituted keys file silently redefines "verified." (Mitigation:
-   out-of-band distribution; the report records key *counts*, not key
-   identities — compare those against expectation.)
+   out-of-band distribution; the report records key counts *and* key ids
+   (`trust.*_key_ids`) — compare those against expectation. The file is
+   also parsed strictly, so a typo'd table fails the run instead of
+   silently narrowing the trust set.)
 2. A compromised or unpinned auditor key yields packs that verify but
    lie. (Mitigation: `--auditor-public-key`; offline auditor keys.)
 3. Pre-copy tampering on a live system. (Mitigation: copy from quorum

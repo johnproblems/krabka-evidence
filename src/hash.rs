@@ -111,9 +111,22 @@ fn collect_files(
         .collect();
     entries.sort();
     for path in entries {
-        if path.is_dir() {
+        // Never follow symlinks: a cyclic link would recurse forever, and a
+        // link to a fifo or a file outside the input must not be hashed.
+        let file_type = std::fs::symlink_metadata(&path)
+            .map_err(|source| {
+                EvidenceError::input(
+                    context.to_string(),
+                    anyhow::anyhow!("stat {}: {source}", path.display()),
+                )
+            })?
+            .file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_files(root, &path, out, context)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             let relative = path.strip_prefix(root).map_err(|source| {
                 EvidenceError::input(context.to_string(), anyhow::anyhow!(source.to_string()))
             })?;

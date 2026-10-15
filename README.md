@@ -14,7 +14,7 @@ inputs.
 
 ## Demos
 
-Two terminal recordings, generated from real runs by `scripts/demo.py` —
+Four terminal recordings, generated from real runs by `scripts/demo.py` —
 the generator executes every filmed command, asserts its exit code and
 output, and renders the captured bytes (no staged output):
 
@@ -24,6 +24,14 @@ output, and renders the captured bytes (no staged output):
 ![Tamper detected end to end](docs/demo/demo-tamper.gif)
 *Tamper: a forged signature fails the build, and the finding names its
 offset ([MP4](docs/demo/demo-tamper.mp4))*
+
+![Bypass detected end to end](docs/demo/demo-bypass.gif)
+*Bypass: the new `bypass` fixture builds to one finding, cited by audit
+offset ([MP4](docs/demo/demo-bypass.mp4))*
+
+![JSON outputs end to end](docs/demo/demo-json.gif)
+*JSON: machine-readable build and verify summaries plus the recorded
+trust ids ([MP4](docs/demo/demo-json.mp4))*
 
 Regenerate with `python3 scripts/demo.py` (needs `ffmpeg`/`ffprobe` on
 PATH — e.g. `nix shell nixpkgs#ffmpeg` — plus a monospace TTF). The
@@ -71,9 +79,11 @@ finding: `missing-audit` (deleted tail segment), `flipped-sig` (forged
 operator signature under a re-sealed chain), `approver-change`
 (mid-window approver drift), `corrupt-chain` (broken checkpoint
 signature), `expired-approval` (approval after expiry), `worm-tamper`
-(rewritten manifest link). Each produces exactly one finding;
+(rewritten manifest link), `bypass` (an action that ran `bypassed`),
+`gated-op` (a deletion no proposal covers), `unknown-key` (a signature
+from outside the trust set). Each produces exactly one finding;
 `unsigned` stays clean with attested-only notes. Each scenario dir holds
-a `README.txt` describing its tamper.
+a `README.txt` describing its tamper and its expected exit code.
 
 ## Usage: run it against your cluster
 
@@ -102,7 +112,8 @@ a `README.txt` describing its tamper.
    `--from`/`--to` accept `YYYY-MM-DD`, RFC 3339, or epoch millis
    (unbounded when absent, `--to` exclusive). `--cluster-id` is
    required for freeze signatures (the preimage covers it). The output
-   directory must not nest with any input.
+   directory must not nest with any input, and must be new or empty
+   unless `--overwrite` is passed.
 5. **Read the result.** Exit `0` is clean, `1` is findings — open
    `evidence/report.html`, or `report.json` for machines (see
    [Findings guide](#findings-guide)). An auditor re-verifies without a
@@ -110,9 +121,9 @@ a `README.txt` describing its tamper.
    ```sh
    krabka-evidence verify evidence/ --auditor-public-key auditor.pub
    ```
-   Add `--audit ... --metadata ... --archive ...` to re-hash the inputs
-   against the pack's digests, or `--fail-on-findings` to reject packs
-   that hold findings.
+   Add `--audit ... --metadata ... --operator-keys ... --archive ...`
+   to re-hash the inputs against the pack's digests, or
+   `--fail-on-findings` to reject packs that hold findings.
 
 The full operator runbook (S3 setup, WORM grading flags, limits for
 hostile inputs, CI gating) is [docs/OPERATORS.md](docs/OPERATORS.md).
@@ -262,6 +273,8 @@ digest; `--strict-orphans` fails on orphan objects;
   verifies, with finding titles.
 - [docs/FORMAT.md](docs/FORMAT.md) — the pack layout, `report.json`
   schema, canonical JSON, and signing.
+- [docs/OUTPUT-JSON.md](docs/OUTPUT-JSON.md) — the `--format json`
+  shapes for build, verify, and `--list-checks`.
 - [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) — what a pack proves,
   trust roots, and known blind spots.
 
@@ -272,7 +285,10 @@ common ones:
 
 | Error | Fix |
 |---|---|
+| `bad flag: …` | A flag value is wrong; the message and `hint:` name it |
 | `refusing to write the pack … nests with the input` | Move `-o` outside every input directory |
+| `output … exists and is not empty` | Use a fresh `-o`, or pass `--overwrite` |
+| `key files already exist …` | Use a fresh `--out`, or pass `keygen --force` |
 | `… is N bytes, over --max-segment-bytes M` | Raise the flag, or check for a runaway file |
 | `archive verification timed out after Ns` | Raise `--archive-timeout-secs`; check endpoint and credentials |
 | `no [[operator_keys]], [[audit_keys]], or [[worm_keys]] entries` | Provision at least one key table |
@@ -280,6 +296,10 @@ common ones:
 | `… NOT CHECKED: no [[audit_keys]] entry` | Add audit keys (file or `--audit-key-id`/`--audit-public-key`) |
 | `freeze signatures NOT CHECKED` | Pass `--cluster-id` |
 | `pack was written by X; this verifier is Y` | Re-run with matching tool versions |
+| `cannot read auditor pin …` | Check the `--auditor-public-key` path (raw 32 bytes or 64 hex chars) |
+| `report.sig is N byte(s), want … 64 …` | The pack's signature file is truncated; rebuild the pack |
+| `fixture --events must be at least 1` | Pass a positive `--events` count |
+| `--max-timeline-rows must be at least 1` | Pass a positive row cap |
 | `FAIL: … input digest differs from the pack's record` | The input changed since the build; re-copy the original |
 | `not a directory and not an s3:// URL` | Fix `--archive` (path or `s3://bucket[/prefix]`) |
 | S3 access errors | Check the ambient AWS chain (`AWS_*`, role, `--s3-endpoint`) |

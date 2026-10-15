@@ -73,6 +73,30 @@ impl CheckId {
         }
     }
 
+    /// Position in the canonical report order (the `ALL_CHECKS` order).
+    ///
+    /// ```
+    /// use krabka_evidence::finding::CheckId;
+    ///
+    /// assert!(CheckId::AuditChain.report_order() < CheckId::WormArchive.report_order());
+    /// ```
+    #[must_use]
+    pub const fn report_order(self) -> usize {
+        match self {
+            Self::AuditChain => 0,
+            Self::AuditLossWindows => 1,
+            Self::WormArchive => 2,
+            Self::MetadataCoverage => 3,
+            Self::AppliedWithNoAuditEvent => 4,
+            Self::AuditedActionNotInMetadata => 5,
+            Self::SignatureVerification => 6,
+            Self::TwoPersonRule => 7,
+            Self::BypassListing => 8,
+            Self::ApproverSetChange => 9,
+            Self::GatedOperationWithoutApproval => 10,
+        }
+    }
+
     /// Kebab-case id, mirroring [`CheckId::from_kebab`].
     ///
     /// ```
@@ -154,6 +178,22 @@ impl Finding {
         self.time_ms = Some(time_ms);
         self
     }
+}
+
+/// Sort findings by report order, then cited offsets, for a stable report.
+pub fn sort_findings(findings: &mut [Finding]) {
+    findings.sort_by_key(|finding| {
+        (
+            finding.check.report_order(),
+            finding.audit_offset.unwrap_or(i64::MAX),
+            finding.metadata_offset.unwrap_or(i64::MAX),
+        )
+    });
+}
+
+/// Sort notes by report order, keeping arrival order within a check.
+pub fn sort_notes(notes: &mut [Note]) {
+    notes.sort_by_key(|note| note.check.report_order());
 }
 
 /// Informational record: in the report, but not a finding.

@@ -18,8 +18,12 @@ does assume the inputs are a **consistent set of copies**:
 
 Copy first, then run. The report digests every local input
 (`input-files.json`), so `verify --audit … --metadata … --archive …` can
-later prove the pack was built from exactly those bytes. The output
-directory must not nest with any input — the run is refused otherwise.
+later prove the pack was built from exactly those bytes. Symlinks inside
+the inputs are never followed (a cyclic link would recurse forever), so
+resolve the copies to real files first. The output directory must not
+nest with any input — the run is refused otherwise (paths are
+canonicalized first, so `audit/../evidence` dodges nothing) — and it must
+be new or empty unless `--overwrite` is passed.
 
 ## Keys
 
@@ -45,22 +49,30 @@ Broker keys can also come from flags: `--audit-key-id` with
 `--audit-public-key` (single), and repeatable `--worm-key-id` with
 `--worm-public-key`, paired by position. Missing keys never fail the run;
 the affected checks grade `not-checked` and say so (`NOT CHECKED` notes).
+The file is parsed strictly: unknown tables or fields (a typo'd
+`[[operator_key]]`) fail the run, as do duplicate worm key ids and blank
+key ids.
 
 The report key is separate: mint it with `keygen --out auditor
---key-id auditor-1`, keep `auditor.priv.pkcs8` offline, and pass
+--key-id auditor-1` (which refuses to overwrite existing files unless
+`--force` is passed), keep `auditor.priv.pkcs8` offline, and pass
 `--sign-with auditor.priv.pkcs8`. `verify` trusts the auditor key
 embedded in the pack unless `--auditor-public-key` pins the expected
-`auditor.pub` — pin it whenever the pack crosses a trust boundary.
+key — pin it whenever the pack crosses a trust boundary. The pin file
+holds either the raw 32-byte `auditor.pub` or its 64-char hex encoding.
 
 ## S3 archives
 
 `--archive s3://bucket[/prefix]` reads with `AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY` from the environment when both are set, else the
-instance/task role. `--s3-region` defaults to `us-east-1`;
-`--s3-endpoint` points at compatible stores (MinIO, LocalStack), with
-`--allow-http` for plaintext endpoints. Remote archives are never hashed:
+instance/task role. `--s3-region` defaults to `us-east-1` but reads
+`AWS_REGION` when the flag is absent; `--s3-endpoint` points at compatible
+stores (MinIO, LocalStack), reading `AWS_ENDPOINT_URL_S3` when the flag
+is absent, with `--allow-http` for plaintext endpoints. Explicit flags
+always win over the environment. Remote archives are never hashed:
 their `report.json` digest reads `remote:<url>`, and re-hashing one is
-skipped with a note.
+skipped with a note (silent under `--quiet`). `--verbose` prints the
+region and endpoint the run resolved before the archive walk.
 
 ## Exit codes and output
 
@@ -71,17 +83,26 @@ skipped with a note.
 | 2 | Unreadable inputs/keys/pack, bad flags, archive timeout |
 
 `--format json` emits one summary object (`status`, `findings`, `notes`,
-`pack`, `not_checked`); `--quiet` prints nothing and lets the exit code
-answer; `--verbose` narrates each phase and every input digest to stderr.
-Every exit-2 error is followed by a `hint:` line with the fix.
+`pack`, `not_checked`, plus the per-check table) — `status` is `clean`,
+`findings`, or `not-checked` when `--require-all-checked` fails a
+finding-free run; `--quiet` prints nothing and lets the exit code answer;
+`--verbose` narrates each phase, every input digest, and the total elapsed
+time to stderr. Every exit-2 error is followed by a `hint:` line with the
+fix. Flag errors say `bad flag` (missing flags, unknown `--only` ids,
+unparsable `--expect-head`, which is validated before any ledger is read);
+only malformed `--from`/`--to` values say `bad time window`. The JSON
+shapes are specified in [OUTPUT-JSON.md](OUTPUT-JSON.md).
 
 ## Windows and time
 
 `--from`/`--to` accept `YYYY-MM-DD`, RFC 3339, or epoch millis; both are
 optional (unbounded when absent) and `--to` is exclusive. Dates are UTC
-midnights. Cross-checks only fire inside the window, so an unbounded run
-over retained history can surface ancient drift — scope the window to the
-period under audit.
+midnights. Surrounding whitespace is ignored, and millis may carry a sign
+(negative values are pre-1970 instants). See
+[CHECKS.md](CHECKS.md#window-scoping) for which checks the window scopes:
+an unbounded run over retained history can surface ancient drift, so scope
+the window to the period under audit. `--from` equal to `--to` is an empty
+window; the report notes it, and the window-scoped checks cannot fire.
 
 ## Limits for hostile or huge inputs
 
@@ -89,7 +110,7 @@ period under audit.
 |---|---|---|
 | `--max-segment-bytes` | 1 GiB | Refuse any ledger file over this size |
 | `--archive-timeout-secs` | 600 | Give up on the archive walk after this long (`0` disables) |
-| `--max-timeline-rows` | 100,000 | Keep the earliest rows; note the truncation |
+| `--max-timeline-rows` | 100,000 | Keep the earliest rows; note the truncation (at least 1) |
 
 Release builds verify roughly 130k audit records/s (10M records in about
 75 seconds), so the caps above are about containment, not throughput.
@@ -115,10 +136,16 @@ krabka-evidence --from 2026-09-01 --to 2026-10-01 \
   --auditor-key-id auditor-1 -o evidence/
 
 krabka-evidence verify evidence/ --auditor-public-key auditor.pub \
-  --audit ./audit-partition --metadata ./cluster-metadata
+  --audit ./audit-partition --metadata ./cluster-metadata \
+  --operator-keys keys.toml
 ```
 
 Practicing without a cluster: `fixture --scenario all --out /tmp/demo`
-writes all eight scenarios (see each `README.txt`); `--scenario bulk
---events N` writes volume; `--seed` reproduces fixtures byte for byte;
+writes all eleven scenarios (see each `README.txt`, which states its
+expected exit code and finding); `--scenario bulk --events N` writes
+volume (`--events` must be at least 1; `--layout capture` does not apply
+to bulk); `--seed` reproduces fixtures byte for byte, bulk included;
 `--layout capture` writes the metadata input as a backup capture.
+Scenario names match case-insensitively, and `fixture --list-scenarios`
+lists them. Ledger segments walk in numeric base-offset order, so
+unpadded names (`9.log` before `10.log`) read correctly.

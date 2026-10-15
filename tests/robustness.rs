@@ -10,9 +10,9 @@ use std::{
 };
 
 use assert_cmd::Command;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use krabka_evidence::{
-    audit::read_audit_ledger,
+    audit::{decode_partition, read_audit_ledger},
     finding::{Finding, Note},
     keys::{TrustMaterial, load_trust},
     metadata::read_metadata_ledger,
@@ -186,4 +186,124 @@ fn segments_and_snapshots_mix_is_noted() {
             .any(|note| note.detail.contains("mixes log segments and snapshots")),
         "the mix is noted: {notes:?}"
     );
+}
+
+/// One record with a JSON body, for reader probes.
+fn json_record(body: &str, offset_delta: i32) -> Record {
+    Record {
+        attributes: 0,
+        timestamp_delta: 0,
+        offset_delta,
+        key: None,
+        value: Some(Bytes::copy_from_slice(body.as_bytes())),
+        headers: Vec::new(),
+    }
+}
+
+/// One tombstone record (no value), for reader probes.
+const fn tombstone_record(offset_delta: i32) -> Record {
+    Record {
+        attributes: 0,
+        timestamp_delta: 0,
+        offset_delta,
+        key: None,
+        value: None,
+        headers: Vec::new(),
+    }
+}
+
+/// Encode one batch and write it as `name` under `dir`.
+fn write_probe_batch(dir: &Path, name: &str, base_offset: i64, records: Vec<Record>) {
+    let batch = RecordBatch {
+        base_offset,
+        partition_leader_epoch: 0,
+        attributes: Attributes::default(),
+        last_offset_delta: i32::try_from(records.len()).unwrap_or(1) - 1,
+        base_timestamp: base_offset,
+        max_timestamp: base_offset,
+        producer_id: -1,
+        producer_epoch: -1,
+        base_sequence: -1,
+        records,
+    };
+    let mut buffer = BytesMut::new();
+    batch.encode(&mut buffer).expect("probe batch encodes");
+    std::fs::write(dir.join(name), buffer.freeze()).expect("probe segment writes");
+}
+
+/// #I18: audit segments walk in numeric order even when unpadded.
+#[test]
+fn audit_segments_walk_in_numeric_order() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, base) in [("9.log", 9i64), ("10.log", 10i64)] {
+        let body = serde_json::json!({"time": base}).to_string();
+        write_probe_batch(dir.path(), name, base, vec![json_record(&body, 0)]);
+    }
+    let mut notes = Vec::new();
+    let rows = decode_partition(dir.path(), u64::MAX, &mut notes).expect("segments decode");
+    let offsets: Vec<i64> = rows.iter().map(|row| row.offset).collect();
+    assert_eq!(offsets, [9, 10], "numeric order, not lexical");
+}
+
+/// #I19: undecodable audit records are counted, not dropped silently.
+#[test]
+fn undecodable_audit_records_are_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = serde_json::json!({"time": 5}).to_string();
+    write_probe_batch(
+        dir.path(),
+        "0.log",
+        0,
+        vec![
+            tombstone_record(0),
+            json_record(&good, 1),
+            tombstone_record(2),
+        ],
+    );
+    let mut notes: Vec<Note> = Vec::new();
+    let rows = decode_partition(dir.path(), u64::MAX, &mut notes).expect("segments decode");
+    assert_eq!(rows.len(), 1, "the decodable record still decodes");
+    assert!(
+        notes.iter().any(|note| note
+            .detail
+            .contains("2 audit record(s) could not be decoded")),
+        "the tombstones are counted: {notes:?}"
+    );
+}
+
+/// #I20: an audit input with no decodable events says so.
+#[test]
+fn empty_audit_input_is_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let trust = fixture_trust();
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut notes: Vec<Note> = Vec::new();
+    let ledger = read_audit_ledger(dir.path(), &trust, 1 << 30, &mut findings, &mut notes)
+        .expect("an empty partition still reads");
+    assert!(ledger.rows.is_empty());
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.detail.contains("decoded 0 records")),
+        "the empty input is noted: {notes:?}"
+    );
+}
+
+/// #I24: a snapshot with no parsable end offset is disclosed.
+#[test]
+fn unparsed_snapshot_names_are_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("garbage.checkpoint"), []).unwrap();
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut notes: Vec<Note> = Vec::new();
+    let ledger = read_metadata_ledger(dir.path(), 1 << 30, &mut findings, &mut notes)
+        .expect("a snapshot-only input still reads");
+    assert_eq!(ledger.coverage_floor, Some(i64::MAX));
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.detail.contains("no parsable end offset")),
+        "the unparsed name is noted: {notes:?}"
+    );
+    assert_eq!(findings.len(), 1, "the floor is still a finding");
 }

@@ -39,6 +39,7 @@ use crate::error::EvidenceError;
 
 /// One `[[operator_keys]]` entry in the keys file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorKeyFileEntry {
     /// Stable identifier that signed records name.
     pub key_id: String,
@@ -51,6 +52,7 @@ pub struct OperatorKeyFileEntry {
 /// One `[[audit_keys]]` or `[[worm_keys]]` entry: a broker key with no
 /// principal binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrokerKeyFileEntry {
     /// Stable identifier that checkpoints or manifests name.
     pub key_id: String,
@@ -60,6 +62,7 @@ pub struct BrokerKeyFileEntry {
 
 /// The parsed keys file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeysFile {
     /// Operator keys, the same table the broker and `krabka-guard` read.
     #[serde(default)]
@@ -102,6 +105,12 @@ pub struct TrustMaterial {
     pub audit_count: usize,
     /// Count of provisioned worm keys.
     pub worm_count: usize,
+    /// Key ids of the provisioned operator keys, in file order.
+    pub operator_key_ids: Vec<String>,
+    /// Key ids of the provisioned audit keys (at most one).
+    pub audit_key_ids: Vec<String>,
+    /// Key ids of the provisioned worm keys, file entries then CLI pairs.
+    pub worm_key_ids: Vec<String>,
 }
 
 /// Load the keys file and any CLI-supplied broker keys.
@@ -110,8 +119,9 @@ pub struct TrustMaterial {
 ///
 /// Returns [`EvidenceError::KeysUnreadable`] when the file cannot be read or
 /// parsed, when a public key file is missing or malformed, when more than
-/// one audit key is configured, or when two operator entries share a
-/// `key_id` or principal.
+/// one audit key is configured, when two operator entries share a `key_id`
+/// or principal, when two worm entries share a `key_id`, or when any entry
+/// carries a blank `key_id`.
 pub fn load_trust(
     keys_path: &Path,
     cli_audit_keys: &[CliKeyPair],
@@ -140,6 +150,7 @@ pub fn load_trust(
             ),
         });
     }
+    reject_blank_cli_keys(keys_path, cli_audit_keys, cli_worm_keys)?;
     let base = keys_path.parent().unwrap_or_else(|| Path::new("."));
 
     let mut operator_entries = Vec::with_capacity(parsed.operator_keys.len());
@@ -171,6 +182,10 @@ pub fn load_trust(
             ),
         });
     }
+    let audit_key_ids: Vec<String> = audit_pairs
+        .iter()
+        .map(|(key_id, _)| key_id.clone())
+        .collect();
     let audit = audit_pairs
         .into_iter()
         .next()
@@ -184,6 +199,11 @@ pub fn load_trust(
             read_raw_key(&pair.public_key, keys_path, "worm", &pair.key_id)?,
         ));
     }
+    reject_duplicate_worm_ids(keys_path, &worm_pairs)?;
+    let worm_key_ids: Vec<String> = worm_pairs
+        .iter()
+        .map(|(key_id, _)| key_id.clone())
+        .collect();
     let worm = TrustedManifestKeys::from_pairs(worm_pairs);
 
     Ok(TrustMaterial {
@@ -193,10 +213,51 @@ pub fn load_trust(
         operator_count: operators.len(),
         audit_count: usize::from(!parsed.audit_keys.is_empty() || !cli_audit_keys.is_empty()),
         worm_count: parsed.worm_keys.len() + cli_worm_keys.len(),
+        operator_key_ids: parsed
+            .operator_keys
+            .iter()
+            .map(|entry| entry.key_id.clone())
+            .collect(),
+        audit_key_ids,
+        worm_key_ids,
         operators,
         audit,
         worm,
     })
+}
+
+/// Reject CLI-supplied broker keys with blank key ids.
+fn reject_blank_cli_keys(
+    keys_path: &Path,
+    cli_audit_keys: &[CliKeyPair],
+    cli_worm_keys: &[CliKeyPair],
+) -> Result<(), EvidenceError> {
+    for pair in cli_audit_keys.iter().chain(cli_worm_keys) {
+        if pair.key_id.trim().is_empty() {
+            return Err(EvidenceError::KeysUnreadable {
+                path: keys_path.to_path_buf(),
+                source: anyhow::anyhow!("CLI key with a blank key_id"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reject two worm entries sharing a `key_id` (file and CLI combined).
+fn reject_duplicate_worm_ids(
+    keys_path: &Path,
+    worm_pairs: &[(String, Vec<u8>)],
+) -> Result<(), EvidenceError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (key_id, _) in worm_pairs {
+        if !seen.insert(key_id.clone()) {
+            return Err(EvidenceError::KeysUnreadable {
+                path: keys_path.to_path_buf(),
+                source: anyhow::anyhow!("duplicate worm key_id {key_id:?}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Read the raw keys of one file table.
@@ -208,6 +269,12 @@ fn read_pairs(
 ) -> Result<Vec<(String, Vec<u8>)>, EvidenceError> {
     let mut pairs = Vec::with_capacity(entries.len());
     for entry in entries {
+        if entry.key_id.trim().is_empty() {
+            return Err(EvidenceError::KeysUnreadable {
+                path: keys_path.to_path_buf(),
+                source: anyhow::anyhow!("{kind} key with a blank key_id"),
+            });
+        }
         let path = base.join(&entry.public_key_path);
         let bytes = read_raw_key(&path, keys_path, kind, &entry.key_id)?;
         pairs.push((entry.key_id.clone(), bytes));

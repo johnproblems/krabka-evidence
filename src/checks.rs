@@ -789,7 +789,7 @@ fn check_bypass_listing(inputs: &CheckInputs<'_>, findings: &mut Vec<Finding>) {
         if !inputs.window.contains(row.time_ms) {
             continue;
         }
-        if event.phase == "bypassed" {
+        if event.phase.eq_ignore_ascii_case("bypassed") {
             findings.push(
                 Finding::new(
                     CheckId::BypassListing,
@@ -803,7 +803,9 @@ fn check_bypass_listing(inputs: &CheckInputs<'_>, findings: &mut Vec<Finding>) {
                 .with_time_ms(row.time_ms),
             );
         }
-        if event.action.contains("unclean") && event.reason.contains("audit-only") {
+        let action = event.action.to_ascii_lowercase();
+        let reason = event.reason.to_ascii_lowercase();
+        if action.contains("unclean") && reason.contains("audit-only") {
             findings.push(
                 Finding::new(
                     CheckId::BypassListing,
@@ -825,7 +827,7 @@ fn check_bypass_listing(inputs: &CheckInputs<'_>, findings: &mut Vec<Finding>) {
         if proposal.action == BreakGlassAction::UncleanRecovery
             && proposal.consumed_at_ms > 0
             && inputs.window.contains(proposal.consumed_at_ms)
-            && proposal.reason.contains("audit-only")
+            && proposal.reason.to_ascii_lowercase().contains("audit-only")
         {
             findings.push(
                 Finding::new(

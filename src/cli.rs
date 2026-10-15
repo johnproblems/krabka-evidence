@@ -113,6 +113,9 @@ pub struct BuildArgs {
     /// Output directory for the evidence pack.
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
+    /// Write into a non-empty output directory (refused by default).
+    #[arg(long)]
+    pub overwrite: bool,
     /// Cluster id, required to verify freeze signatures.
     #[arg(long, value_name = "ID")]
     pub cluster_id: Option<String>,
@@ -141,10 +144,15 @@ pub struct BuildArgs {
     #[arg(long, value_name = "PATH", requires = "worm_key_id")]
     pub worm_public_key: Vec<PathBuf>,
     /// S3 region for --archive s3:// URLs.
-    #[arg(long, value_name = "REGION", default_value = "us-east-1")]
+    #[arg(
+        long,
+        value_name = "REGION",
+        default_value = "us-east-1",
+        env = "AWS_REGION"
+    )]
     pub s3_region: String,
     /// Custom S3 endpoint, for example <http://minio:9000>.
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", env = "AWS_ENDPOINT_URL_S3")]
     pub s3_endpoint: Option<String>,
     /// Allow plaintext HTTP for S3.
     #[arg(long)]
@@ -191,6 +199,9 @@ pub struct VerifyArgs {
     /// Re-hash this metadata input and compare with the pack's digest.
     #[arg(long, value_name = "PATH")]
     pub metadata: Option<PathBuf>,
+    /// Re-hash this keys file and compare with the pack's digest.
+    #[arg(long, value_name = "PATH")]
+    pub operator_keys: Option<PathBuf>,
     /// Re-hash this archive input and compare with the pack's digest.
     #[arg(long, value_name = "PATH-OR-URL")]
     pub archive: Option<String>,
@@ -211,15 +222,22 @@ pub struct KeygenArgs {
     /// Key id recorded when this key signs a report.
     #[arg(long, value_name = "ID", default_value = "auditor-1")]
     pub key_id: String,
+    /// Overwrite existing key files (refused by default).
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Generate fixture inputs.
 #[derive(Debug, Args)]
 pub struct FixtureArgs {
     /// Scenario: clean, missing-audit, flipped-sig, approver-change,
-    /// corrupt-chain, expired-approval, unsigned, worm-tamper, bulk, or all.
+    /// corrupt-chain, expired-approval, unsigned, worm-tamper, bypass,
+    /// gated-op, unknown-key, bulk, or all.
     #[arg(long, value_name = "NAME", default_value = "all")]
     pub scenario: String,
+    /// List scenario names and exit.
+    #[arg(long)]
+    pub list_scenarios: bool,
     /// Output directory.
     #[arg(long, value_name = "PATH")]
     pub out: PathBuf,

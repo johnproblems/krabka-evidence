@@ -39,7 +39,9 @@ irrelevant — see canonicalization):
 - `counts`: `audit_records`, `metadata_records`, `worm_manifests`,
   `timeline_rows`, `findings`, `notes`.
 - `trust`: keys provisioned for the run: `operators`, `audit`, `worm`
-  counts.
+  counts, plus the `operator_key_ids`, `audit_key_ids`, and `worm_key_ids`
+  arrays naming the trust roots the pack was built under. Compare them
+  against expectation before citing a pack.
 - `timeline_truncated`: whether `--max-timeline-rows` dropped rows.
 - `auditor`: the signing key — `key_id` from `--auditor-key-id` and the
   raw 32-byte Ed25519 `public_key_hex` the signature verifies against.

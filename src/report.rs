@@ -54,7 +54,7 @@ pub struct CheckSummary {
     pub findings: usize,
 }
 
-/// How many keys of each kind were provisioned for the run.
+/// Which keys were provisioned for the run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustCounts {
     /// Operator keys.
@@ -63,6 +63,12 @@ pub struct TrustCounts {
     pub audit: usize,
     /// WORM manifest keys.
     pub worm: usize,
+    /// Key ids of the provisioned operator keys, in file order.
+    pub operator_key_ids: Vec<String>,
+    /// Key ids of the provisioned audit keys (at most one).
+    pub audit_key_ids: Vec<String>,
+    /// Key ids of the provisioned worm keys, file entries then CLI pairs.
+    pub worm_key_ids: Vec<String>,
 }
 
 /// Report counts for the summary header.
@@ -381,6 +387,15 @@ pub fn verify_pack(dir: &Path) -> Result<PackVerification, EvidenceError> {
             "report format {:?} is not {REPORT_FORMAT:?}",
             report.format
         )));
+    }
+    if signature.len() != 64 {
+        return Ok(inauthentic(
+            report,
+            format!(
+                "report.sig is {} byte(s), want the raw 64-byte Ed25519 signature",
+                signature.len()
+            ),
+        ));
     }
     let public_key = hex::decode(report.auditor.public_key_hex.trim())
         .map_err(|_| unreadable("auditor public key is not hex".to_string()))?;

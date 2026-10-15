@@ -226,6 +226,131 @@ fn unsigned_events_note_but_stay_clean() {
     );
 }
 
+/// #I37: a `bypassed` privileged event gives exactly one finding.
+#[test]
+fn bypassed_action_gives_exactly_one_finding() {
+    let out = fixtures();
+    let (code, report, _) = build_pack(&out.join("bypass"));
+    assert_eq!(code, 1, "findings exit 1");
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+    let finding = &findings[0];
+    assert_eq!(finding["check"], "bypass-listing");
+    assert_eq!(finding["title"], "Gated action bypassed approval");
+    assert_eq!(finding["audit_offset"], 14);
+    assert_eq!(finding["time_ms"], 1_789_430_886_000i64);
+    assert!(
+        finding["detail"].as_str().unwrap().contains("BYPASSED"),
+        "names the phase: {finding:?}"
+    );
+}
+
+/// #I38: a gated op with no covering proposal gives exactly one finding.
+#[test]
+fn gated_op_without_approval_gives_exactly_one_finding() {
+    let out = fixtures();
+    let (code, report, _) = build_pack(&out.join("gated-op"));
+    assert_eq!(code, 1, "findings exit 1");
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+    let finding = &findings[0];
+    assert_eq!(finding["check"], "gated-operation-without-approval");
+    assert_eq!(finding["title"], "Gated op without approval");
+    assert_eq!(finding["audit_offset"], 15);
+    assert!(
+        finding["detail"].as_str().unwrap().contains("ghost"),
+        "names the uncovered resource: {finding:?}"
+    );
+}
+
+/// #I39: an event signed outside the trust set gives exactly one finding.
+#[test]
+fn unknown_key_gives_exactly_one_finding() {
+    let out = fixtures();
+    let (code, report, _) = build_pack(&out.join("unknown-key"));
+    assert_eq!(code, 1, "findings exit 1");
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+    let finding = &findings[0];
+    assert_eq!(finding["check"], "signature-verification");
+    assert_eq!(finding["title"], "Unknown key");
+    assert_eq!(finding["audit_offset"], 1);
+    assert!(
+        finding["detail"].as_str().unwrap().contains("mallory-2099"),
+        "names the unknown key: {finding:?}"
+    );
+}
+
+/// #I34: bulk fixtures honor `--seed`.
+#[test]
+fn bulk_seed_makes_deterministic_output() {
+    let base = std::env::temp_dir().join(format!(
+        "krabka-evidence-tests-bulkseed-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    for (name, seed) in [("one", "s"), ("two", "s"), ("three", "other")] {
+        binary()
+            .args([
+                "fixture",
+                "--scenario",
+                "bulk",
+                "--events",
+                "20",
+                "--seed",
+                seed,
+                "--out",
+            ])
+            .arg(base.join(name))
+            .assert()
+            .success();
+    }
+    let one = tree_hashes(&base.join("one/bulk"));
+    let two = tree_hashes(&base.join("two/bulk"));
+    let three = tree_hashes(&base.join("three/bulk"));
+    assert_eq!(one, two, "the same seed reproduces every byte");
+    assert_ne!(one, three, "a different seed mints different keys");
+}
+
+/// #I40: `all` writes every scenario directory.
+#[test]
+fn all_scenarios_generate() {
+    let out = fixtures();
+    assert_eq!(Scenario::all().len(), 11, "eleven scenarios");
+    for scenario in Scenario::all() {
+        let root = out.join(scenario.dir_name());
+        for child in ["audit", "metadata", "archive", "keys", "README.txt"] {
+            assert!(
+                root.join(child).exists(),
+                "{child} exists under {}",
+                scenario.dir_name()
+            );
+        }
+    }
+}
+
+/// #I41: every scenario README states its expected exit and finding.
+#[test]
+fn scenario_readmes_state_expected_outcomes() {
+    let out = fixtures();
+    for scenario in Scenario::all() {
+        let (exit, finding) = scenario.expected_outcome();
+        let readme = out.join(scenario.dir_name()).join("README.txt");
+        let text = std::fs::read_to_string(&readme).expect("README.txt reads");
+        assert!(
+            text.contains(&format!("Expected: exit {exit}")),
+            "{readme:?} states its exit code"
+        );
+        match finding {
+            Some(title) => assert!(text.contains(title), "{readme:?} names its finding"),
+            None => assert!(
+                text.contains("no findings"),
+                "{readme:?} says it stays clean"
+            ),
+        }
+    }
+}
+
 /// Generate the capture-layout fixtures once (shared across threads).
 fn capture_fixtures() -> PathBuf {
     static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();

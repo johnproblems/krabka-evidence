@@ -276,6 +276,206 @@ fn times_format_as_rfc3339() {
     assert_eq!(format_time(1_789_430_400_000), "2026-09-15T00:00:00.000Z");
 }
 
+/// #I1: findings and notes sort by report order, not variant-name order.
+///
+/// Debug-name order would file `applied-with-no-audit-event` before
+/// `audit-chain` and `two-person-rule` before `worm-archive`; the report
+/// order is the reverse in both cases.
+#[test]
+fn report_items_sort_by_report_order() {
+    use krabka_evidence::{
+        finding::{CheckId, Finding, Note, sort_findings, sort_notes},
+        report::ALL_CHECKS,
+    };
+    for (index, id) in ALL_CHECKS.iter().enumerate() {
+        assert_eq!(id.report_order(), index, "order of {}", id.kebab());
+    }
+    let mut findings = vec![
+        Finding::new(CheckId::TwoPersonRule, "t", "d"),
+        Finding::new(CheckId::WormArchive, "t", "d"),
+        Finding::new(CheckId::AppliedWithNoAuditEvent, "t", "d"),
+        Finding::new(CheckId::AuditChain, "t", "d"),
+    ];
+    sort_findings(&mut findings);
+    let order: Vec<CheckId> = findings.iter().map(|finding| finding.check).collect();
+    assert_eq!(
+        order,
+        [
+            CheckId::AuditChain,
+            CheckId::WormArchive,
+            CheckId::AppliedWithNoAuditEvent,
+            CheckId::TwoPersonRule,
+        ]
+    );
+    let mut tied = vec![
+        Finding::new(CheckId::AuditChain, "t", "d").with_audit_offset(9),
+        Finding::new(CheckId::AuditChain, "t", "d").with_audit_offset(2),
+    ];
+    sort_findings(&mut tied);
+    assert_eq!(tied[0].audit_offset, Some(2));
+    let mut notes = vec![
+        Note::new(CheckId::TwoPersonRule, "b"),
+        Note::new(CheckId::WormArchive, "a"),
+    ];
+    sort_notes(&mut notes);
+    assert_eq!(notes[0].check, CheckId::WormArchive);
+}
+
+/// #I12: two worm entries sharing a key id are refused.
+#[test]
+fn duplicate_worm_key_ids_are_refused() {
+    use krabka_evidence::keys::CliKeyPair;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("w1.pub"), vec![1u8; 32]).unwrap();
+    std::fs::write(dir.path().join("w2.pub"), vec![2u8; 32]).unwrap();
+    // Twice in the file.
+    std::fs::write(
+        dir.path().join("keys.toml"),
+        "[[worm_keys]]\nkey_id = \"worm-1\"\npublic_key_path = \"w1.pub\"\n\
+         [[worm_keys]]\nkey_id = \"worm-1\"\npublic_key_path = \"w2.pub\"\n",
+    )
+    .unwrap();
+    let error = load_trust(&dir.path().join("keys.toml"), &[], &[]).unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate worm key_id"),
+        "names the duplicate: {error}"
+    );
+    // Once in the file, once on the CLI.
+    std::fs::write(
+        dir.path().join("keys2.toml"),
+        "[[worm_keys]]\nkey_id = \"worm-1\"\npublic_key_path = \"w1.pub\"\n",
+    )
+    .unwrap();
+    let cli = CliKeyPair {
+        key_id: "worm-1".to_string(),
+        public_key: dir.path().join("w2.pub"),
+    };
+    let error = load_trust(&dir.path().join("keys2.toml"), &[], &[cli]).unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate worm key_id"),
+        "file-plus-CLI duplicates refuse too: {error}"
+    );
+}
+
+/// #I13: blank broker key ids are refused.
+#[test]
+fn blank_broker_key_ids_are_refused() {
+    use krabka_evidence::keys::CliKeyPair;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("w.pub"), vec![3u8; 32]).unwrap();
+    std::fs::write(dir.path().join("op.pub"), vec![4u8; 32]).unwrap();
+    std::fs::write(
+        dir.path().join("keys.toml"),
+        "[[worm_keys]]\nkey_id = \"\"\npublic_key_path = \"w.pub\"\n",
+    )
+    .unwrap();
+    let error = load_trust(&dir.path().join("keys.toml"), &[], &[]).unwrap_err();
+    assert!(
+        error.to_string().contains("blank key_id"),
+        "blank file ids refuse: {error}"
+    );
+    std::fs::write(
+        dir.path().join("keys2.toml"),
+        "[[operator_keys]]\nkey_id = \"op\"\nprincipal = \"User:op\"\n\
+         public_key_path = \"op.pub\"\n",
+    )
+    .unwrap();
+    let cli = CliKeyPair {
+        key_id: "  ".to_string(),
+        public_key: dir.path().join("w.pub"),
+    };
+    let error = load_trust(&dir.path().join("keys2.toml"), &[], &[cli]).unwrap_err();
+    assert!(
+        error.to_string().contains("blank key_id"),
+        "blank CLI ids refuse: {error}"
+    );
+}
+
+/// #I14: a typo'd keys table fails loudly instead of parsing as empty.
+#[test]
+fn unknown_keys_tables_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("keys.toml"),
+        "[[operator_key]]\nkey_id = \"op\"\nprincipal = \"User:op\"\n\
+         public_key_path = \"op.pub\"\n",
+    )
+    .unwrap();
+    assert!(
+        load_trust(&dir.path().join("keys.toml"), &[], &[]).is_err(),
+        "a singular [[operator_key]] table is refused"
+    );
+    std::fs::write(dir.path().join("op.pub"), vec![5u8; 32]).unwrap();
+    std::fs::write(
+        dir.path().join("keys2.toml"),
+        "[[operator_keys]]\nkey_id = \"op\"\nprincipal = \"User:op\"\n\
+         public_key_path = \"op.pub\"\nextra_field = 1\n",
+    )
+    .unwrap();
+    assert!(
+        load_trust(&dir.path().join("keys2.toml"), &[], &[]).is_err(),
+        "an unknown entry field is refused"
+    );
+}
+
+/// #I17: symlinks are never followed when hashing inputs.
+#[test]
+#[cfg(unix)]
+fn hashing_skips_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("real.txt"), b"bytes").unwrap();
+    std::os::unix::fs::symlink("real.txt", dir.path().join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("loop-b", dir.path().join("loop-a")).unwrap();
+    std::os::unix::fs::symlink("loop-a", dir.path().join("loop-b")).unwrap();
+    let digest = digest_path(dir.path(), "test").unwrap();
+    assert_eq!(digest.files, 1, "only the real file is hashed");
+    assert!(digest.file_hashes.contains_key("real.txt"));
+}
+
+/// #I18: unpadded segment stems sort numerically.
+#[test]
+fn ledger_files_sort_by_numeric_stem() {
+    use std::path::PathBuf;
+
+    use krabka_evidence::audit::sort_ledger_files;
+    let mut paths = vec![
+        PathBuf::from("10.log"),
+        PathBuf::from("9.log"),
+        PathBuf::from("00000000000000000002.log"),
+    ];
+    sort_ledger_files(&mut paths);
+    let names: Vec<&str> = paths.iter().map(|path| path.to_str().unwrap()).collect();
+    assert_eq!(names, ["00000000000000000002.log", "9.log", "10.log"]);
+}
+
+/// #I32: scenario names match case-insensitively.
+#[test]
+fn scenario_names_match_case_insensitively() {
+    use krabka_evidence::fixture::Scenario;
+    assert_eq!(Scenario::from_name("CLEAN"), Some(Scenario::Clean));
+    assert_eq!(
+        Scenario::from_name("Flipped-Sig"),
+        Some(Scenario::FlippedSignature)
+    );
+    assert_eq!(Scenario::from_name("GATED-OP"), Some(Scenario::GatedOp));
+    assert_eq!(Scenario::from_name("no-such-scenario"), None);
+}
+
+/// #I35: window values tolerate whitespace and signed millis.
+#[test]
+fn window_parses_signed_millis_and_whitespace() {
+    let padded = parse_window(Some("  2026-09-01  "), Some("2026-10-01")).unwrap();
+    let plain = parse_window(Some("2026-09-01"), Some("2026-10-01")).unwrap();
+    assert_eq!(padded.from_ms, plain.from_ms);
+    assert_eq!(padded.to_ms, plain.to_ms);
+    let negative = parse_window(Some("-1000"), None).unwrap();
+    assert_eq!(negative.from_ms, -1000);
+    let explicit = parse_window(Some("+42"), None).unwrap();
+    assert_eq!(explicit.from_ms, 42);
+    assert!(parse_window(Some(""), None).is_err());
+    assert!(parse_window(Some("-"), None).is_err());
+}
+
 /// Minimal report inputs for rendering tests.
 fn empty_report_inputs() -> ReportInputs {
     ReportInputs {
@@ -294,6 +494,9 @@ fn empty_report_inputs() -> ReportInputs {
             operators: 0,
             audit: 0,
             worm: 0,
+            operator_key_ids: Vec::new(),
+            audit_key_ids: Vec::new(),
+            worm_key_ids: Vec::new(),
         },
         timeline_truncated: false,
         auditor: AuditorIdentity {
